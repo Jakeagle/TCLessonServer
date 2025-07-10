@@ -9,6 +9,7 @@ const port = process.env.PORT || 4000;
 const allowedOrigins = process.env.ALLOWED_ORIGINS.split(",");
 const mongoUri = process.env.MONGODB_URI;
 
+app.use(express.static('public'));
 app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
