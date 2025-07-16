@@ -397,6 +397,58 @@ app.get("/lessons/:teacherName", async (req, res) => {
   }
 });
 
+app.post("/saveUnitChanges", async (req, res) => {
+  try {
+    const { teacherName, unitData } = req.body;
+
+    if (!teacherName || !unitData) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: teacherName, unitData",
+      });
+    }
+
+    console.log(`Saving unit changes for teacher: "${teacherName}"`);
+    console.log("Unit data:", JSON.stringify(unitData, null, 2));
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+
+    // Update the specific unit in the teacher's document
+    const updateResult = await teachersCollection.updateOne(
+      { name: teacherName, "units.value": unitData.value },
+      { $set: { "units.$": unitData } }
+    );
+
+    if (updateResult.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Teacher or unit not found.",
+      });
+    }
+
+    console.log(`Unit changes saved successfully for teacher ${teacherName}.`);
+
+    // Emit Socket.IO event to update lesson management modal
+    io.emit("unitUpdated", {
+      teacherName: teacherName,
+      unitData: unitData,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Unit changes saved successfully.",
+    });
+  } catch (error) {
+    console.error("Failed to save unit changes:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to save unit changes.",
+    });
+  }
+});
+
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
