@@ -9,7 +9,6 @@ const port = process.env.PORT || 4000;
 const allowedOrigins = process.env.ALLOWED_ORIGINS.split(",");
 const mongoUri = process.env.MONGODB_URI;
 
-app.use(express.static('public'));
 app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
@@ -125,6 +124,22 @@ app.post("/save-lesson", async (req, res) => {
     console.log(
       `Lesson added to unit '${unit.name}' for teacher '${teacher}'.`
     );
+
+    // --- 3. Emit Socket.IO event to update lesson management modal ---
+    io.emit("lessonCreated", {
+      teacherName: teacher,
+      lessonData: {
+        _id: lessonInsertResult.insertedId,
+        ...lesson,
+      },
+      unitData: unit,
+    });
+
+    // Also emit a unit update event in case this created a new unit
+    io.emit("unitUpdated", {
+      teacherName: teacher,
+      unitData: unit,
+    });
 
     res
       .status(201)
@@ -309,6 +324,13 @@ app.post("/assign-unit", async (req, res) => {
     console.log(
       `Assigned unit to ${studentUpdateResult.modifiedCount} students in period ${classPeriod} for teacher ${teacherName}.`
     );
+
+    // --- Emit Socket.IO event to update lesson management modal ---
+    io.emit("unitAssigned", {
+      teacherName: teacherName,
+      unitData: assignedUnit,
+      classPeriod: classPeriod,
+    });
 
     res
       .status(200)
