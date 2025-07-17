@@ -43,6 +43,33 @@ io.on("connection", (socket) => {
       socket.emit("error", { message: "Failed to identify user" });
     }
   });
+
+  // Handle teacher lesson management events
+  socket.on("joinLessonManagement", (teacherName) => {
+    try {
+      console.log(`Teacher ${teacherName} joined lesson management`);
+      socket.join(`lessonManagement-${teacherName}`);
+      socket.emit("lessonManagementJoined", {
+        success: true,
+        teacherName: teacherName,
+      });
+    } catch (error) {
+      console.error("Error joining lesson management:", error);
+      socket.emit("error", { message: "Failed to join lesson management" });
+    }
+  });
+
+  // Handle disconnect
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+    // Remove from userSockets map
+    for (const [userId, userSocket] of userSockets.entries()) {
+      if (userSocket === socket) {
+        userSockets.delete(userId);
+        break;
+      }
+    }
+  });
 });
 
 /*****************************************MongoDB***************************************************/
@@ -125,6 +152,34 @@ app.post("/save-lesson", async (req, res) => {
       `Lesson added to unit '${unit.name}' for teacher '${teacher}'.`
     );
 
+    // --- Fetch updated unit data from database before emitting events ---
+    const updatedTeacherDoc = await teachersCollection.findOne(
+      { name: teacher },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    let updatedUnit = null;
+    if (updatedTeacherDoc && updatedTeacherDoc.units) {
+      updatedUnit = updatedTeacherDoc.units.find((u) => u.value === unit.value);
+    }
+
+    // Fallback to original unit data if fetch fails
+    const unitToEmit = updatedUnit || unit;
+
+    console.log("--- Debug: Unit data being emitted ---");
+    console.log("Unit name:", unitToEmit.name);
+    console.log("Unit value:", unitToEmit.value);
+    console.log(
+      "Number of lessons in unit:",
+      unitToEmit.lessons ? unitToEmit.lessons.length : 0
+    );
+    if (unitToEmit.lessons && unitToEmit.lessons.length > 0) {
+      console.log(
+        "Lesson titles:",
+        unitToEmit.lessons.map((l) => l.lesson_title)
+      );
+    }
+
     // --- 3. Emit Socket.IO event to update lesson management modal ---
     io.emit("lessonCreated", {
       teacherName: teacher,
@@ -132,14 +187,42 @@ app.post("/save-lesson", async (req, res) => {
         _id: lessonInsertResult.insertedId,
         ...lesson,
       },
-      unitData: unit,
+      unitData: unitToEmit,
     });
 
-    // Also emit a unit update event in case this created a new unit
-    io.emit("unitUpdated", {
+    // Emit event specifically for lesson management modal refresh
+    io.emit("lessonManagementRefresh", {
       teacherName: teacher,
-      unitData: unit,
+      action: "lessonAdded",
+      lessonData: {
+        _id: lessonInsertResult.insertedId,
+        ...lesson,
+      },
+      unitData: unitToEmit,
     });
+
+    // Emit to teacher-specific lesson management room
+    io.to(`lessonManagement-${teacher}`).emit("newLessonAdded", {
+      teacherName: teacher,
+      lessonData: {
+        _id: lessonInsertResult.insertedId,
+        ...lesson,
+      },
+      unitData: unitToEmit,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log(`--- Socket events emitted for lesson creation ---`);
+    console.log(
+      `Events: lessonCreated, unitUpdated, lessonManagementRefresh, newLessonAdded`
+    );
+    console.log(`Teacher: ${teacher}`);
+    console.log(`Unit: ${unitToEmit.name} (${unitToEmit.value})`);
+    console.log(`Lesson: ${lesson.lesson_title}`);
+    console.log(
+      `Lessons in unit after creation: ${unitToEmit.lessons ? unitToEmit.lessons.length : 0}`
+    );
+    console.log("--- End debug info ---");
 
     res
       .status(201)
@@ -332,6 +415,22 @@ app.post("/assign-unit", async (req, res) => {
       classPeriod: classPeriod,
     });
 
+    // Emit event specifically for lesson management modal refresh
+    io.emit("lessonManagementRefresh", {
+      teacherName: teacherName,
+      action: "unitAssigned",
+      unitData: assignedUnit,
+      classPeriod: classPeriod,
+    });
+
+    // Emit to teacher-specific lesson management room
+    io.to(`lessonManagement-${teacherName}`).emit("unitAssignmentUpdated", {
+      teacherName: teacherName,
+      unitData: assignedUnit,
+      classPeriod: classPeriod,
+      timestamp: new Date().toISOString(),
+    });
+
     res
       .status(200)
       .json({ success: true, message: "Unit assigned successfully." });
@@ -359,36 +458,170 @@ app.get("/lessons/:teacherName", async (req, res) => {
       .collection("Teachers");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
+    // Define the master teacher whose content becomes default for all users
+    const MASTER_TEACHER = "admin@trinity-capital.net";
+
     // Fetch units from the teacher's document
     const teacherDocument = await teachersCollection.findOne(
       { name: teacherName },
       { projection: { units: 1, _id: 0 } } // Only get the units field, exclude _id
     );
 
-    // Fetch all individual lessons from the Lessons collection
-    const allLessons = await lessonsCollection
+    // Fetch master teacher's content as defaults
+    let masterUnits = [];
+    let masterLessons = [];
+
+    if (teacherName !== MASTER_TEACHER) {
+      console.log(`Fetching master content from ${MASTER_TEACHER}...`);
+
+      // Get master teacher's units
+      const masterTeacherDocument = await teachersCollection.findOne(
+        { name: MASTER_TEACHER },
+        { projection: { units: 1, _id: 0 } }
+      );
+
+      if (masterTeacherDocument && masterTeacherDocument.units) {
+        masterUnits = masterTeacherDocument.units;
+        console.log(
+          `Found ${masterUnits.length} master units from ${MASTER_TEACHER}.`
+        );
+      }
+
+      // Get master teacher's lessons
+      const masterLessonsData = await lessonsCollection
+        .find({ teacher: MASTER_TEACHER })
+        .project({ lesson: 1, _id: 1 })
+        .toArray();
+
+      masterLessons = masterLessonsData.map((item) => ({
+        _id: item._id,
+        ...item.lesson,
+        isMasterContent: true, // Flag to identify master content
+      }));
+
+      console.log(
+        `Found ${masterLessons.length} master lessons from ${MASTER_TEACHER}.`
+      );
+    }
+
+    // Fetch teacher's own lessons
+    const teacherLessons = await lessonsCollection
       .find({ teacher: teacherName })
-      .project({ lesson: 1, _id: 1 }) // Project lesson object AND the document's _id
+      .project({ lesson: 1, _id: 1 })
       .toArray();
 
-    // The result is an array of objects like [{ _id: ..., lesson: {...} }, ...].
-    // We'll map this to a more useful structure for the frontend.
-    const flattenedLessons = allLessons.map((item) => ({
+    const teacherFlattenedLessons = teacherLessons.map((item) => ({
       _id: item._id,
-      ...item.lesson, // Spread the properties of the nested lesson object
+      ...item.lesson,
+      isMasterContent: false, // Flag teacher's own content
     }));
 
-    const units =
+    // For lesson management modal: prioritize teacher's own units, fallback to master units
+    let combinedUnits = [];
+    const teacherUnits =
       teacherDocument && teacherDocument.units ? teacherDocument.units : [];
 
-    console.log(`Found ${units.length} units for teacher ${teacherName}.`);
-    console.log(
-      `Found ${flattenedLessons.length} total lessons for teacher ${teacherName}.`
-    );
+    if (teacherName === MASTER_TEACHER) {
+      // For master teacher, just return their own content
+      combinedUnits = teacherUnits;
+    } else {
+      // For other teachers: merge custom units with remaining default units
+      if (teacherUnits.length > 0) {
+        // Teacher has their own units - merge with remaining default units
+        // Start with teacher's custom units
+        combinedUnits = [...teacherUnits];
 
-    res
-      .status(200)
-      .json({ success: true, units: units, lessons: flattenedLessons });
+        // Add default units that haven't been replaced by custom units
+        const customUnitValues = new Set(
+          teacherUnits.map((unit) => unit.value)
+        );
+        const remainingDefaultUnits = masterUnits
+          .filter((unit) => !customUnitValues.has(unit.value))
+          .map((unit) => ({
+            ...unit,
+            isDefaultUnit: true, // Flag to indicate this is a default unit
+          }));
+
+        combinedUnits.push(...remainingDefaultUnits);
+
+        console.log(
+          `Using teacher's ${teacherUnits.length} custom units + ${remainingDefaultUnits.length} remaining default units`
+        );
+      } else {
+        // Teacher has no units yet - show master units as defaults
+        combinedUnits = masterUnits.map((unit) => ({
+          ...unit,
+          isDefaultUnit: true, // Flag to indicate this is a default unit
+        }));
+        console.log(
+          `Teacher has no units yet, showing ${masterUnits.length} default units from ${MASTER_TEACHER}`
+        );
+      }
+    }
+
+    // For lesson management modal: prioritize teacher's own lessons, include master lessons appropriately
+    let combinedLessons = [];
+
+    if (teacherName === MASTER_TEACHER) {
+      // For master teacher, show only their own lessons
+      combinedLessons = teacherFlattenedLessons;
+    } else {
+      if (teacherUnits.length > 0) {
+        // Teacher has their own units - show their own lessons + relevant master lessons for selection
+        combinedLessons = [
+          ...teacherFlattenedLessons, // Teacher's own lessons first
+          ...masterLessons.filter(
+            (masterLesson) =>
+              !teacherFlattenedLessons.some(
+                (teacherLesson) =>
+                  teacherLesson.lesson_title === masterLesson.lesson_title
+              )
+          ), // Add master lessons that don't conflict with teacher's lessons
+        ];
+      } else {
+        // Teacher has no units yet - show master lessons as defaults for lesson management
+        combinedLessons = masterLessons.map((lesson) => ({
+          ...lesson,
+          isDefaultLesson: true, // Flag to indicate this is a default lesson
+        }));
+        console.log(
+          `Teacher has no lessons yet, showing ${masterLessons.length} default lessons from ${MASTER_TEACHER}`
+        );
+      }
+    }
+
+    console.log(`Final result for ${teacherName}:`);
+    if (teacherName === MASTER_TEACHER) {
+      console.log(
+        `- ${combinedUnits.length} own units, ${combinedLessons.length} own lessons (master teacher)`
+      );
+    } else if (teacherUnits.length > 0) {
+      const customUnits = combinedUnits.filter((u) => !u.isDefaultUnit).length;
+      const defaultUnits = combinedUnits.filter((u) => u.isDefaultUnit).length;
+      console.log(
+        `- ${combinedUnits.length} total units (${customUnits} custom + ${defaultUnits} default), ${combinedLessons.length} total lessons (${teacherFlattenedLessons.length} own + ${masterLessons.length} master available)`
+      );
+    } else {
+      console.log(
+        `- ${combinedUnits.length} default units, ${combinedLessons.length} default lessons (from ${MASTER_TEACHER})`
+      );
+    }
+
+    res.status(200).json({
+      success: true,
+      units: combinedUnits,
+      lessons: combinedLessons,
+      masterTeacher: MASTER_TEACHER,
+      isUsingMasterDefaults:
+        teacherName !== MASTER_TEACHER && teacherUnits.length === 0,
+      hasOwnContent: teacherUnits.length > 0,
+      contentType:
+        teacherName === MASTER_TEACHER
+          ? "master"
+          : teacherUnits.length > 0
+            ? "own"
+            : "default",
+    });
   } catch (error) {
     console.error("Failed to fetch lessons from MongoDB:", error);
     res
@@ -415,17 +648,56 @@ app.post("/saveUnitChanges", async (req, res) => {
       .db("TrinityCapital")
       .collection("Teachers");
 
-    // Update the specific unit in the teacher's document
-    const updateResult = await teachersCollection.updateOne(
-      { name: teacherName, "units.value": unitData.value },
-      { $set: { "units.$": unitData } }
-    );
+    // Define the master teacher
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
-    if (updateResult.matchedCount === 0) {
-      return res.status(404).json({
+    // Check if this is a default unit being edited by a non-master teacher
+    if (unitData.isDefaultUnit && teacherName !== MASTER_TEACHER) {
+      console.log(
+        `Teacher ${teacherName} attempted to edit default unit. Blocking with guidance message.`
+      );
+      return res.status(403).json({
         success: false,
-        message: "Teacher or unit not found.",
+        message:
+          "You cannot modify default units. Please create your own unit and lessons instead.",
+        isDefaultUnitError: true,
       });
+    }
+
+    // If teacher is trying to save a default unit and they ARE the master teacher,
+    // update the master teacher's document instead
+    if (unitData.isDefaultUnit && teacherName === MASTER_TEACHER) {
+      console.log(
+        `Master teacher editing default unit - updating master document`
+      );
+      // Remove the isDefaultUnit flag before saving
+      const cleanUnitData = { ...unitData };
+      delete cleanUnitData.isDefaultUnit;
+
+      const updateResult = await teachersCollection.updateOne(
+        { name: MASTER_TEACHER, "units.value": cleanUnitData.value },
+        { $set: { "units.$": cleanUnitData } }
+      );
+
+      if (updateResult.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Master teacher unit not found.",
+        });
+      }
+    } else {
+      // Normal case: teacher editing their own unit
+      const updateResult = await teachersCollection.updateOne(
+        { name: teacherName, "units.value": unitData.value },
+        { $set: { "units.$": unitData } }
+      );
+
+      if (updateResult.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Teacher or unit not found.",
+        });
+      }
     }
 
     console.log(`Unit changes saved successfully for teacher ${teacherName}.`);
@@ -434,6 +706,20 @@ app.post("/saveUnitChanges", async (req, res) => {
     io.emit("unitUpdated", {
       teacherName: teacherName,
       unitData: unitData,
+    });
+
+    // Emit event specifically for lesson management modal refresh
+    io.emit("lessonManagementRefresh", {
+      teacherName: teacherName,
+      action: "unitModified",
+      unitData: unitData,
+    });
+
+    // Emit to teacher-specific lesson management room
+    io.to(`lessonManagement-${teacherName}`).emit("unitChangesApplied", {
+      teacherName: teacherName,
+      unitData: unitData,
+      timestamp: new Date().toISOString(),
     });
 
     res.status(200).json({
@@ -445,6 +731,578 @@ app.post("/saveUnitChanges", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to save unit changes.",
+    });
+  }
+});
+
+app.post("/create-custom-unit", async (req, res) => {
+  try {
+    const { teacherName, unitData } = req.body;
+
+    if (!teacherName || !unitData) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: teacherName, unitData",
+      });
+    }
+
+    console.log(`Creating custom unit for teacher: "${teacherName}"`);
+    console.log("Unit data:", JSON.stringify(unitData, null, 2));
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+
+    // Define the master teacher
+    const MASTER_TEACHER = "admin@trinity-capital.net";
+
+    // Prepare the unit data
+    const newUnit = {
+      value: unitData.value,
+      name: unitData.name,
+      lessons: [],
+      isDefaultUnit: false, // Mark as custom unit
+    };
+
+    // Check if teacher already has this unit
+    const teacherDocument = await teachersCollection.findOne(
+      { name: teacherName },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    if (teacherDocument && teacherDocument.units) {
+      const existingUnitIndex = teacherDocument.units.findIndex(
+        (unit) => unit.value === unitData.value
+      );
+
+      if (existingUnitIndex !== -1) {
+        // Replace existing unit (could be default or custom)
+        const updateResult = await teachersCollection.updateOne(
+          { name: teacherName, "units.value": unitData.value },
+          { $set: { "units.$": newUnit } }
+        );
+
+        if (updateResult.matchedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Failed to update existing unit.",
+          });
+        }
+
+        console.log(
+          `Replaced existing unit ${unitData.value} for teacher ${teacherName}`
+        );
+      } else {
+        // Add new unit
+        const addResult = await teachersCollection.updateOne(
+          { name: teacherName },
+          { $push: { units: newUnit } }
+        );
+
+        if (addResult.matchedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Teacher not found.",
+          });
+        }
+
+        console.log(
+          `Added new unit ${unitData.value} for teacher ${teacherName}`
+        );
+      }
+    } else {
+      // Teacher has no units array yet, create it with this unit
+      const addResult = await teachersCollection.updateOne(
+        { name: teacherName },
+        { $set: { units: [newUnit] } }
+      );
+
+      if (addResult.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Teacher not found.",
+        });
+      }
+
+      console.log(
+        `Created first unit ${unitData.value} for teacher ${teacherName}`
+      );
+    }
+
+    // Emit Socket.IO events
+    io.emit("unitCreated", {
+      teacherName: teacherName,
+      unitData: newUnit,
+    });
+
+    io.emit("lessonManagementRefresh", {
+      teacherName: teacherName,
+      action: "unitCreated",
+      unitData: newUnit,
+    });
+
+    io.to(`lessonManagement-${teacherName}`).emit("customUnitCreated", {
+      teacherName: teacherName,
+      unitData: newUnit,
+      timestamp: new Date().toISOString(),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Custom unit created successfully.",
+      unitData: newUnit,
+    });
+  } catch (error) {
+    console.error("Failed to create custom unit:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create custom unit.",
+    });
+  }
+});
+
+app.post("/copy-default-unit", async (req, res) => {
+  try {
+    const { teacherName, unitValue } = req.body;
+
+    if (!teacherName || !unitValue) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: teacherName, unitValue",
+      });
+    }
+
+    // Define the master teacher
+    const MASTER_TEACHER = "admin@trinity-capital.net";
+
+    if (teacherName === MASTER_TEACHER) {
+      return res.status(400).json({
+        success: false,
+        message: "Master teacher cannot copy default units.",
+      });
+    }
+
+    console.log(
+      `Copying default unit "${unitValue}" for teacher: "${teacherName}"`
+    );
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Get the master teacher's unit
+    const masterTeacherDocument = await teachersCollection.findOne(
+      { name: MASTER_TEACHER },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    if (!masterTeacherDocument || !masterTeacherDocument.units) {
+      return res.status(404).json({
+        success: false,
+        message: "Master teacher content not found.",
+      });
+    }
+
+    const masterUnit = masterTeacherDocument.units.find(
+      (unit) => unit.value === unitValue
+    );
+
+    if (!masterUnit) {
+      return res.status(404).json({
+        success: false,
+        message: "Default unit not found.",
+      });
+    }
+
+    // Get master teacher's lessons for this unit
+    const masterLessonsData = await lessonsCollection
+      .find({
+        teacher: MASTER_TEACHER,
+        "unit.value": unitValue,
+      })
+      .project({ lesson: 1, unit: 1, _id: 0 })
+      .toArray();
+
+    // Create a copy of the unit for the teacher
+    const newUnit = {
+      ...masterUnit,
+      // Remove any master-specific flags
+      isDefaultUnit: undefined,
+      assigned_to_period: undefined, // Don't copy period assignments
+    };
+
+    // Clean the unit data
+    delete newUnit.isDefaultUnit;
+    delete newUnit.assigned_to_period;
+
+    // Check if teacher already has this unit
+    const teacherDocument = await teachersCollection.findOne({
+      name: teacherName,
+      "units.value": unitValue,
+    });
+
+    if (teacherDocument) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "You already have a unit with this identifier. Please modify your existing unit.",
+      });
+    }
+
+    // Add the unit to the teacher's document
+    await teachersCollection.updateOne(
+      { name: teacherName },
+      { $push: { units: newUnit } },
+      { upsert: true }
+    );
+
+    // Copy all lessons from the master teacher to the new teacher
+    const copiedLessons = [];
+    for (const masterLessonDoc of masterLessonsData) {
+      const newLessonDocument = {
+        teacher: teacherName,
+        unit: { ...masterLessonDoc.unit },
+        lesson: { ...masterLessonDoc.lesson },
+        createdAt: new Date(),
+        copiedFromMaster: true,
+      };
+
+      const lessonInsertResult =
+        await lessonsCollection.insertOne(newLessonDocument);
+      copiedLessons.push({
+        _id: lessonInsertResult.insertedId,
+        ...newLessonDocument.lesson,
+      });
+    }
+
+    // Update the unit with the new lesson references
+    if (copiedLessons.length > 0) {
+      const lessonReferences = copiedLessons.map((lesson) => ({
+        _id: lesson._id,
+        lesson_title: lesson.lesson_title,
+        lesson_type: lesson.lesson_type,
+      }));
+
+      await teachersCollection.updateOne(
+        { name: teacherName, "units.value": unitValue },
+        { $set: { "units.$.lessons": lessonReferences } }
+      );
+    }
+
+    console.log(
+      `Successfully copied unit "${masterUnit.name}" with ${copiedLessons.length} lessons to teacher ${teacherName}`
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Unit "${masterUnit.name}" copied successfully with ${copiedLessons.length} lessons. You can now modify it as needed.`,
+      copiedUnit: newUnit,
+      copiedLessonsCount: copiedLessons.length,
+    });
+  } catch (error) {
+    console.error("Failed to copy default unit:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to copy default unit.",
+    });
+  }
+});
+
+app.post("/refresh-lesson-management", async (req, res) => {
+  try {
+    const { teacherName } = req.body;
+
+    if (!teacherName) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required field: teacherName",
+      });
+    }
+
+    console.log(`Manual refresh requested for teacher: ${teacherName}`);
+
+    // Fetch current data for the teacher
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Get updated units
+    const teacherDocument = await teachersCollection.findOne(
+      { name: teacherName },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    // Get all lessons
+    const allLessons = await lessonsCollection
+      .find({ teacher: teacherName })
+      .project({ lesson: 1, _id: 1 })
+      .toArray();
+
+    const flattenedLessons = allLessons.map((item) => ({
+      _id: item._id,
+      ...item.lesson,
+    }));
+
+    const units =
+      teacherDocument && teacherDocument.units ? teacherDocument.units : [];
+
+    console.log(
+      `Refreshing data: ${units.length} units, ${flattenedLessons.length} lessons`
+    );
+
+    // Emit comprehensive refresh event
+    io.emit("lessonManagementCompleteRefresh", {
+      teacherName: teacherName,
+      units: units,
+      lessons: flattenedLessons,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Also emit to teacher-specific room
+    io.to(`lessonManagement-${teacherName}`).emit(
+      "lessonManagementCompleteRefresh",
+      {
+        teacherName: teacherName,
+        units: units,
+        lessons: flattenedLessons,
+        timestamp: new Date().toISOString(),
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Lesson management refreshed successfully.",
+      data: { units, lessons: flattenedLessons },
+    });
+  } catch (error) {
+    console.error("Failed to refresh lesson management:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to refresh lesson management.",
+    });
+  }
+});
+
+app.post("/lesson-management-update", async (req, res) => {
+  try {
+    const { teacherName, action, data } = req.body;
+
+    if (!teacherName || !action) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: teacherName, action",
+      });
+    }
+
+    console.log(
+      `Lesson management update for teacher: ${teacherName}, action: ${action}`
+    );
+
+    // Emit specific event for lesson management modal updates
+    io.emit("lessonManagementUpdate", {
+      teacherName: teacherName,
+      action: action,
+      data: data,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Also emit to specific teacher if they have a socket connection
+    const teacherSocket = userSockets.get(teacherName);
+    if (teacherSocket) {
+      teacherSocket.emit("lessonManagementUpdate", {
+        teacherName: teacherName,
+        action: action,
+        data: data,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Lesson management update sent successfully.",
+    });
+  } catch (error) {
+    console.error("Failed to send lesson management update:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to send lesson management update.",
+    });
+  }
+});
+
+// New endpoint for students to get lessons for their class period
+// This always uses admin@trinity-capital.net's content as the default
+app.get("/student-lessons/:classPeriod", async (req, res) => {
+  try {
+    const { classPeriod } = req.params;
+
+    if (!classPeriod) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required field: classPeriod",
+      });
+    }
+
+    console.log(`Fetching lessons for class period: ${classPeriod}`);
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Always use admin@trinity-capital.net as the master teacher for student content
+    const MASTER_TEACHER = "admin@trinity-capital.net";
+
+    // Get master teacher's units and find which unit is assigned to this class period
+    const masterTeacherDocument = await teachersCollection.findOne(
+      { name: MASTER_TEACHER },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    if (!masterTeacherDocument || !masterTeacherDocument.units) {
+      console.log(`No units found for master teacher: ${MASTER_TEACHER}`);
+      return res.status(404).json({
+        success: false,
+        message:
+          "No default lessons available. Master teacher content not found.",
+      });
+    }
+
+    // Find the unit assigned to this class period
+    const assignedUnit = masterTeacherDocument.units.find(
+      (unit) => unit.assigned_to_period === classPeriod
+    );
+
+    if (!assignedUnit) {
+      console.log(`No unit assigned to class period: ${classPeriod}`);
+      return res.status(404).json({
+        success: false,
+        message: `No lessons assigned to class period ${classPeriod}.`,
+        availableUnits: masterTeacherDocument.units.map((unit) => ({
+          name: unit.name,
+          value: unit.value,
+          assignedPeriod: unit.assigned_to_period || "Not assigned",
+        })),
+      });
+    }
+
+    // Get all lessons from the master teacher for this unit
+    const unitLessons = assignedUnit.lessons || [];
+
+    // Get full lesson details from the Lessons collection
+    const lessonIds = unitLessons
+      .map((lesson) => lesson._id)
+      .filter((id) => id);
+    const fullLessons = [];
+
+    if (lessonIds.length > 0) {
+      const { ObjectId } = require("mongodb");
+      const lessonsFromDb = await lessonsCollection
+        .find({
+          teacher: MASTER_TEACHER,
+          _id: { $in: lessonIds.map((id) => new ObjectId(id)) },
+        })
+        .project({ lesson: 1, _id: 1 })
+        .toArray();
+
+      lessonsFromDb.forEach((item) => {
+        fullLessons.push({
+          _id: item._id,
+          ...item.lesson,
+          isMasterContent: true,
+        });
+      });
+    }
+
+    // Also include lessons directly embedded in the unit
+    unitLessons.forEach((lesson) => {
+      if (!lesson._id) {
+        // This is an embedded lesson, add it directly
+        fullLessons.push({
+          ...lesson,
+          isMasterContent: true,
+        });
+      }
+    });
+
+    console.log(
+      `Found unit "${assignedUnit.name}" with ${fullLessons.length} lessons for period ${classPeriod}`
+    );
+
+    res.status(200).json({
+      success: true,
+      unit: {
+        name: assignedUnit.name,
+        value: assignedUnit.value,
+        classPeriod: classPeriod,
+      },
+      lessons: fullLessons,
+      masterTeacher: MASTER_TEACHER,
+      message: `Lessons for class period ${classPeriod} from ${MASTER_TEACHER}`,
+    });
+  } catch (error) {
+    console.error("Failed to fetch student lessons:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch lessons for students.",
+    });
+  }
+});
+
+// Alternative endpoint for getting master teacher content regardless of class period
+app.get("/master-lessons", async (req, res) => {
+  try {
+    console.log("Fetching all master teacher content for global access");
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Always use admin@trinity-capital.net as the master teacher
+    const MASTER_TEACHER = "admin@trinity-capital.net";
+
+    // Get master teacher's units
+    const masterTeacherDocument = await teachersCollection.findOne(
+      { name: MASTER_TEACHER },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    // Get all master teacher's lessons
+    const masterLessonsData = await lessonsCollection
+      .find({ teacher: MASTER_TEACHER })
+      .project({ lesson: 1, _id: 1 })
+      .toArray();
+
+    const masterLessons = masterLessonsData.map((item) => ({
+      _id: item._id,
+      ...item.lesson,
+      isMasterContent: true,
+    }));
+
+    const masterUnits =
+      masterTeacherDocument && masterTeacherDocument.units
+        ? masterTeacherDocument.units
+        : [];
+
+    console.log(
+      `Returning ${masterUnits.length} units and ${masterLessons.length} lessons from master teacher`
+    );
+
+    res.status(200).json({
+      success: true,
+      units: masterUnits,
+      lessons: masterLessons,
+      masterTeacher: MASTER_TEACHER,
+      message: `All content from master teacher ${MASTER_TEACHER}`,
+    });
+  } catch (error) {
+    console.error("Failed to fetch master lessons:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch master teacher content.",
     });
   }
 });
