@@ -233,6 +233,186 @@ app.post("/save-lesson", async (req, res) => {
   }
 });
 
+app.post("/update-lesson", async (req, res) => {
+  try {
+    const { lesson, unit, teacher, lessonId } = req.body;
+
+    console.log("--- Update Lesson Request ---");
+    console.log("Teacher:", teacher);
+    console.log("Unit:", unit.name, "(" + unit.value + ")");
+    console.log("Lesson ID:", lessonId);
+    console.log("Lesson Title:", lesson.lesson_title);
+
+    // Import ObjectId for MongoDB operations
+    const { ObjectId } = require("mongodb");
+
+    // --- 1. Update the lesson in the "Lessons" collection ---
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    const lessonUpdateResult = await lessonsCollection.updateOne(
+      { _id: new ObjectId(lessonId) },
+      {
+        $set: {
+          "lesson.lesson_title": lesson.lesson_title,
+          "lesson.lesson_description": lesson.lesson_description,
+          "lesson.lesson_blocks": lesson.lesson_blocks,
+          "lesson.lesson_conditions": lesson.lesson_conditions,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (lessonUpdateResult.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Lesson not found in Lessons collection",
+      });
+    }
+
+    console.log("Lesson updated in 'Lessons' collection");
+
+    // --- 2. Update the lesson in the teacher's "Teachers" collection ---
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+
+    // Update the lesson in the specific unit's lessons array
+    const teacherUpdateResult = await teachersCollection.updateOne(
+      {
+        name: teacher,
+        "units.value": unit.value,
+        "units.lessons._id": lessonId,
+      },
+      {
+        $set: {
+          "units.$[unit].lessons.$[lesson].lesson_title": lesson.lesson_title,
+          "units.$[unit].lessons.$[lesson].lesson_description":
+            lesson.lesson_description,
+          "units.$[unit].lessons.$[lesson].lesson_blocks": lesson.lesson_blocks,
+          "units.$[unit].lessons.$[lesson].lesson_conditions":
+            lesson.lesson_conditions,
+        },
+      },
+      {
+        arrayFilters: [
+          { "unit.value": unit.value },
+          { "lesson._id": lessonId },
+        ],
+      }
+    );
+
+    console.log(
+      "Teacher lesson update result:",
+      teacherUpdateResult.matchedCount > 0 ? "Success" : "Not found"
+    );
+
+    // --- 3. Fetch updated unit data ---
+    const updatedTeacherDoc = await teachersCollection.findOne(
+      { name: teacher },
+      { projection: { units: 1, _id: 0 } }
+    );
+
+    let updatedUnit = null;
+    if (updatedTeacherDoc && updatedTeacherDoc.units) {
+      updatedUnit = updatedTeacherDoc.units.find((u) => u.value === unit.value);
+    }
+
+    const unitToEmit = updatedUnit || unit;
+
+    // --- 4. Emit Socket.IO events ---
+    io.emit("lessonUpdated", {
+      teacherName: teacher,
+      lessonData: {
+        _id: lessonId,
+        ...lesson,
+      },
+      unitData: unitToEmit,
+    });
+
+    io.emit("lessonManagementRefresh", {
+      teacherName: teacher,
+      action: "lessonUpdated",
+      lessonData: {
+        _id: lessonId,
+        ...lesson,
+      },
+      unitData: unitToEmit,
+    });
+
+    console.log("--- Socket events emitted for lesson update ---");
+    console.log(`Teacher: ${teacher}`);
+    console.log(`Unit: ${unitToEmit.name} (${unitToEmit.value})`);
+    console.log(`Updated Lesson: ${lesson.lesson_title}`);
+
+    res.status(200).json({
+      success: true,
+      message: "Lesson updated successfully",
+      lessonId: lessonId,
+    });
+  } catch (error) {
+    console.error("Failed to update lesson:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update lesson: " + error.message,
+    });
+  }
+});
+
+// Debug endpoint to check lesson data and history
+app.get("/debug-lesson/:lessonId", async (req, res) => {
+  try {
+    const { lessonId } = req.params;
+    const { ObjectId } = require("mongodb");
+
+    console.log("--- Debug Lesson Request ---");
+    console.log("Lesson ID:", lessonId);
+
+    // Get lesson from both collections
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+
+    // Find in Lessons collection
+    const lessonInLessons = await lessonsCollection.findOne({
+      _id: new ObjectId(lessonId),
+    });
+
+    // Find in Teachers collection
+    const teacherWithLesson = await teachersCollection.findOne({
+      "units.lessons._id": lessonId,
+    });
+
+    let lessonInTeachers = null;
+    if (teacherWithLesson) {
+      for (const unit of teacherWithLesson.units) {
+        const lesson = unit.lessons.find((l) => l._id === lessonId);
+        if (lesson) {
+          lessonInTeachers = {
+            ...lesson,
+            unitName: unit.name,
+            unitValue: unit.value,
+          };
+          break;
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      lessonInLessons: lessonInLessons,
+      lessonInTeachers: lessonInTeachers,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Debug lesson error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to debug lesson: " + error.message,
+    });
+  }
+});
+
 app.post("/upload-whirlpool", (req, res) => {
   try {
     // For now, we are just logging the lesson object that is received.
