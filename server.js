@@ -1787,37 +1787,79 @@ app.post("/get-lessons-by-ids", async (req, res) => {
 
     console.log("--- Get Lessons By ObjectIDs Request ---");
     console.log(`Student: ${studentName || "Unknown"}`);
-    console.log(
-      `Requesting ${lessonIds.length} lessons by ObjectID:`,
-      lessonIds
-    );
+    console.log(`Requesting ${lessonIds.length} lessons by ID:`, lessonIds);
 
     const { ObjectId } = require("mongodb");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    // Convert string IDs to ObjectIds
-    const objectIds = lessonIds
-      .map((id) => {
-        try {
-          return typeof id === "string" ? new ObjectId(id) : id;
-        } catch (error) {
-          console.warn(`Invalid ObjectID: ${id}`);
-          return null;
-        }
-      })
-      .filter((id) => id !== null);
+    // Separate ObjectIds from numeric IDs
+    const objectIds = [];
+    const numericIds = [];
 
-    console.log(`Converted to ${objectIds.length} valid ObjectIDs`);
+    lessonIds.forEach((id) => {
+      try {
+        // Try to create ObjectId - if successful, it's a valid ObjectId
+        new ObjectId(id);
+        objectIds.push(new ObjectId(id));
+      } catch (error) {
+        // If it fails, treat it as a numeric lesson ID
+        console.log(`Treating as numeric lesson ID: ${id}`);
+        numericIds.push(id);
+      }
+    });
 
-    // Fetch lessons from database
-    const lessonDocuments = await lessonsCollection
-      .find({ _id: { $in: objectIds } })
-      .toArray();
+    console.log(
+      `Found ${objectIds.length} ObjectIDs and ${numericIds.length} numeric IDs`
+    );
 
-    console.log(`Found ${lessonDocuments.length} lessons in database`);
+    let lessonDocuments = [];
+
+    // Fetch lessons by ObjectId
+    if (objectIds.length > 0) {
+      const objectIdLessons = await lessonsCollection
+        .find({ _id: { $in: objectIds } })
+        .toArray();
+      lessonDocuments.push(...objectIdLessons);
+      console.log(`Found ${objectIdLessons.length} lessons by ObjectId`);
+    }
+
+    // Fetch lessons by numeric ID (try different fields)
+    if (numericIds.length > 0) {
+      // Try lessonId field
+      const numericLessons1 = await lessonsCollection
+        .find({ lessonId: { $in: numericIds } })
+        .toArray();
+      lessonDocuments.push(...numericLessons1);
+      console.log(`Found ${numericLessons1.length} lessons by lessonId field`);
+
+      // Try _id as string
+      const numericLessons2 = await lessonsCollection
+        .find({ _id: { $in: numericIds } })
+        .toArray();
+      lessonDocuments.push(...numericLessons2);
+      console.log(`Found ${numericLessons2.length} lessons by _id as string`);
+
+      // Try lesson.lesson_id field
+      const numericLessons3 = await lessonsCollection
+        .find({ "lesson.lesson_id": { $in: numericIds } })
+        .toArray();
+      lessonDocuments.push(...numericLessons3);
+      console.log(
+        `Found ${numericLessons3.length} lessons by lesson.lesson_id field`
+      );
+    }
+
+    // Remove duplicates (in case a lesson was found by multiple methods)
+    const uniqueLessons = lessonDocuments.filter(
+      (lesson, index, self) =>
+        index ===
+        self.findIndex((l) => l._id.toString() === lesson._id.toString())
+    );
+
+    console.log(`Found ${uniqueLessons.length} unique lessons in database`);
 
     // Transform lessons to the format expected by the lesson engine
-    const lessons = lessonDocuments.map((doc) => ({
+    const lessons = uniqueLessons.map((doc) => ({
       _id: doc._id,
       lesson_title: doc.lesson.lesson_title,
       lesson_description: doc.lesson.lesson_description,
