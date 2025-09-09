@@ -6,18 +6,64 @@ const app = express();
 const cors = require("cors");
 
 const port = process.env.PORT || 4000;
-const allowedOrigins = process.env.ALLOWED_ORIGINS.split(",");
-const mongoUri = process.env.MONGODB_URI;
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",")
+  : ["http://localhost:3000"];
+const mongoUri =
+  process.env.MONGODB_URI || "mongodb://localhost:27017/TrinityCapital";
 
-app.use(cors({ origin: allowedOrigins }));
+console.log("Configuring CORS with origins:", allowedOrigins);
+
+// Create a CORS middleware with specific options
+app.use(
+  cors({
+    origin: true, // Allow all origins temporarily
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Origin",
+      "X-Requested-With",
+      "Accept",
+    ],
+  })
+);
 app.use(express.json());
+
+// Add error handling middleware for Express parsing errors
+app.use((err, req, res, next) => {
+  console.error("Error in middleware:", err);
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).send({ success: false, message: "Invalid JSON" });
+  }
+  next(err);
+});
+
+// Handle OPTIONS requests for all routes (CORS preflight)
+app.options("*", (req, res) => {
+  console.log("Received preflight OPTIONS request");
+  console.log("Origin:", req.headers.origin);
+
+  // Set CORS headers
+  res.header("Access-Control-Allow-Origin", req.headers.origin);
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Origin, X-Requested-With, Accept"
+  );
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.status(200).end();
+});
 
 /*****************************************Socket.io***************************************************/
 
 const server = require("http").createServer(app);
 const io = require("socket.io")(server, {
   cors: {
-    origin: process.env.SOCKET_ORIGIN.split(","),
+    origin: process.env.SOCKET_ORIGIN
+      ? process.env.SOCKET_ORIGIN.split(",")
+      : ["http://localhost:3000"],
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -163,72 +209,6 @@ app.post("/save-lesson", async (req, res) => {
       { name: teacher },
       { projection: { units: 1, _id: 0 } }
     );
-
-    let updatedUnit = null;
-    if (updatedTeacherDoc && updatedTeacherDoc.units) {
-      updatedUnit = updatedTeacherDoc.units.find((u) => u.value === unit.value);
-    }
-
-    // Fallback to original unit data if fetch fails
-    const unitToEmit = updatedUnit || unit;
-
-    console.log("--- Debug: Unit data being emitted ---");
-    console.log("Unit name:", unitToEmit.name);
-    console.log("Unit value:", unitToEmit.value);
-    console.log(
-      "Number of lessons in unit:",
-      unitToEmit.lessons ? unitToEmit.lessons.length : 0
-    );
-    if (unitToEmit.lessons && unitToEmit.lessons.length > 0) {
-      console.log(
-        "Lesson titles:",
-        unitToEmit.lessons.map((l) => l.lesson_title)
-      );
-    }
-
-    // --- 3. Emit Socket.IO event to update lesson management modal ---
-    io.emit("lessonCreated", {
-      teacherName: teacher,
-      lessonData: {
-        _id: lessonInsertResult.insertedId,
-        ...lesson,
-      },
-      unitData: unitToEmit,
-    });
-
-    // Emit event specifically for lesson management modal refresh
-    io.emit("lessonManagementRefresh", {
-      teacherName: teacher,
-      action: "lessonAdded",
-      lessonData: {
-        _id: lessonInsertResult.insertedId,
-        ...lesson,
-      },
-      unitData: unitToEmit,
-    });
-
-    // Emit to teacher-specific lesson management room
-    io.to(`lessonManagement-${teacher}`).emit("newLessonAdded", {
-      teacherName: teacher,
-      lessonData: {
-        _id: lessonInsertResult.insertedId,
-        ...lesson,
-      },
-      unitData: unitToEmit,
-      timestamp: new Date().toISOString(),
-    });
-
-    console.log(`--- Socket events emitted for lesson creation ---`);
-    console.log(
-      `Events: lessonCreated, unitUpdated, lessonManagementRefresh, newLessonAdded`
-    );
-    console.log(`Teacher: ${teacher}`);
-    console.log(`Unit: ${unitToEmit.name} (${unitToEmit.value})`);
-    console.log(`Lesson: ${lesson.lesson_title}`);
-    console.log(
-      `Lessons in unit after creation: ${unitToEmit.lessons ? unitToEmit.lessons.length : 0}`
-    );
-    console.log("--- End debug info ---");
 
     res
       .status(201)
@@ -1775,10 +1755,46 @@ app.get("/master-lessons", async (req, res) => {
 
 // NEW: Get full lesson content by ObjectIDs for students
 app.post("/get-lessons-by-ids", async (req, res) => {
+  // Set CORS headers explicitly for this endpoint
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Origin, X-Requested-With, Accept"
+  );
+  res.header("Access-Control-Allow-Credentials", "true");
+
+  // Handle preflight OPTIONS request
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
   try {
-    const { lessonIds, studentName } = req.body;
+    // SUPER LOUD DEBUG - ALWAYS VISIBLE
+    console.log("\n\n");
+    console.log(
+      "*************************************************************"
+    );
+    console.log(
+      "************ LESSON SERVER: GET-LESSONS-BY-IDS **************"
+    );
+    console.log(
+      "*************************************************************"
+    );
+    console.log("TIME:", new Date().toISOString());
+    console.log("REQUEST RECEIVED FROM CLIENT");
+    console.log("REQUEST HEADERS:", JSON.stringify(req.headers, null, 2));
+    console.log("REQUEST BODY:", JSON.stringify(req.body, null, 2));
+
+    const { lessonIds, studentName, studentProfile } = req.body;
 
     if (!lessonIds || !Array.isArray(lessonIds) || lessonIds.length === 0) {
+      console.log("ERROR: Missing or invalid lessonIds array");
+      console.log("REQUEST BODY STRUCTURE:", Object.keys(req.body));
+      console.log("LESSON IDS TYPE:", typeof lessonIds);
+      console.log("LESSON IDS VALUE:", lessonIds);
+      console.log(
+        "*************************************************************\n\n"
+      );
       return res.status(400).json({
         success: false,
         message: "Missing or invalid lessonIds array",
@@ -1786,58 +1802,492 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     }
 
     console.log("--- Get Lessons By ObjectIDs Request ---");
-    console.log(`Student: ${studentName || "Unknown"}`);
+    console.log(`[get-lessons-by-ids] Student: ${studentName || "Unknown"}`);
+    if (studentProfile) {
+      console.log(
+        "[get-lessons-by-ids] Student profile:",
+        JSON.stringify(studentProfile, null, 2)
+      );
+    }
     console.log(
-      `Requesting ${lessonIds.length} lessons by ObjectID:`,
+      `[get-lessons-by-ids] Requesting ${lessonIds.length} lessons by ID:`,
       lessonIds
     );
 
     const { ObjectId } = require("mongodb");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    // Convert string IDs to ObjectIds
-    const objectIds = lessonIds
-      .map((id) => {
+    // Log the structure of a few lessons in the database for debugging
+    console.log("🔍 DEBUG: Checking lesson structure in database...");
+    const sampleLessons = await lessonsCollection.find().limit(2).toArray();
+    console.log(
+      "Sample lessons structure:",
+      JSON.stringify(
+        sampleLessons.map((l) => ({
+          _id: l._id,
+          lesson_title: l.lesson?.lesson_title || "No title",
+          fields: Object.keys(l),
+        })),
+        null,
+        2
+      )
+    );
+
+    // ENHANCED ID PROCESSING: Handle multiple ID formats thoroughly
+    const objectIds = [];
+    const stringIds = [];
+    const numericIds = [];
+
+    console.log("\n📊 ID PROCESSING DETAILS 📊");
+    console.log("==========================");
+    console.log(`Total lesson IDs to process: ${lessonIds.length}`);
+
+    lessonIds.forEach((id, index) => {
+      // Store original form for logging
+      console.log(`\n🔍 Processing ID[${index}]: "${id}", Type: ${typeof id}`);
+
+      if (typeof id === "number") {
+        numericIds.push(id);
+        console.log(`  ➕ Added ${id} to numericIds array`);
+
+        // Also try to convert to ObjectId
         try {
-          return typeof id === "string" ? new ObjectId(id) : id;
-        } catch (error) {
-          console.warn(`Invalid ObjectID: ${id}`);
-          return null;
+          const objId = new ObjectId(id.toString());
+          objectIds.push(objId);
+          console.log(
+            `  ➕ Converted to ObjectId: ${objId} and added to objectIds array`
+          );
+        } catch (e) {
+          console.log(
+            `  ❌ Could not convert numeric ID ${id} to ObjectId: ${e.message}`
+          );
         }
-      })
-      .filter((id) => id !== null);
+      } else if (typeof id === "string") {
+        // Save the string version
+        stringIds.push(id);
+        console.log(`  ➕ Added "${id}" to stringIds array`);
 
-    console.log(`Converted to ${objectIds.length} valid ObjectIDs`);
+        // Try to parse as number if it looks numeric
+        if (/^\d+$/.test(id)) {
+          const numId = parseInt(id, 10);
+          numericIds.push(numId);
+          console.log(
+            `  ➕ Converted to number: ${numId} and added to numericIds array`
+          );
+        } else {
+          console.log(
+            `  ℹ️ ID "${id}" doesn't look like a number, not converting`
+          );
+        }
 
-    // Fetch lessons from database
-    const lessonDocuments = await lessonsCollection
-      .find({ _id: { $in: objectIds } })
-      .toArray();
+        // Try as ObjectId
+        try {
+          const objId = new ObjectId(id);
+          objectIds.push(objId);
+          console.log(
+            `  ➕ Converted to ObjectId: ${objId} and added to objectIds array`
+          );
+        } catch (e) {
+          console.log(
+            `  ❌ Could not convert string ID "${id}" to ObjectId: ${e.message}`
+          );
+        }
+      } else {
+        console.log(`  ⚠️ Unexpected ID type: ${typeof id}, value: ${id}`);
+      }
+    });
 
-    console.log(`Found ${lessonDocuments.length} lessons in database`);
+    console.log("\n📋 ID PROCESSING SUMMARY 📋");
+    console.log("==========================");
+    console.log(
+      `✅ Processed IDs: ${objectIds.length} ObjectIDs, ${stringIds.length} strings, ${numericIds.length} numbers`
+    );
+    if (objectIds.length > 0) {
+      console.log(
+        `📦 ObjectIDs: ${objectIds.map((id) => id.toString()).join(", ")}`
+      );
+    }
+    if (stringIds.length > 0) {
+      console.log(`📦 StringIDs: ${stringIds.join(", ")}`);
+    }
+    if (numericIds.length > 0) {
+      console.log(`📦 NumericIDs: ${numericIds.join(", ")}`);
+    }
+
+    let lessonDocuments = [];
+
+    console.log("\n🔎 DATABASE QUERY EXECUTION 🔎");
+    console.log("=============================");
+
+    // Try to find lessons using ObjectIds for the _id field
+    if (objectIds.length > 0) {
+      console.log("\n📌 QUERY #1: Using ObjectIds for _id field");
+      console.log(
+        `Query: db.Lessons.find({ _id: { $in: [${objectIds.map((id) => id.toString()).join(", ")}] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const objectIdLessons = await lessonsCollection
+          .find({ _id: { $in: objectIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...objectIdLessons);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(`✅ Found ${objectIdLessons.length} lessons by ObjectId`);
+
+        if (objectIdLessons.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = objectIdLessons[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(`   - Fields: ${Object.keys(firstLesson).join(", ")}`);
+          console.log(`   - Has 'lesson' property: ${!!firstLesson.lesson}`);
+          if (firstLesson.lesson) {
+            console.log(
+              `   - Lesson title: ${firstLesson.lesson.lesson_title || "Not available"}`
+            );
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Error in ObjectId query: ${error.message}`);
+      }
+    }
+
+    // Try to find lessons using string IDs for various ID fields
+    if (stringIds.length > 0) {
+      console.log("\n📌 QUERY #2: Using string IDs for lesson.lesson_id field");
+      console.log(
+        `Query: db.Lessons.find({ "lesson.lesson_id": { $in: ["${stringIds.join('", "')}"] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const stringLessons1 = await lessonsCollection
+          .find({ "lesson.lesson_id": { $in: stringIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...stringLessons1);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${stringLessons1.length} lessons by lesson.lesson_id field`
+        );
+
+        if (stringLessons1.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = stringLessons1[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(
+            `   - lesson.lesson_id: ${firstLesson.lesson?.lesson_id || "Not available"}`
+          );
+        }
+      } catch (error) {
+        console.error(`❌ Error in lesson.lesson_id query: ${error.message}`);
+      }
+
+      console.log("\n📌 QUERY #3: Using string IDs for lessonId field");
+      console.log(
+        `Query: db.Lessons.find({ "lessonId": { $in: ["${stringIds.join('", "')}"] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const stringLessons2 = await lessonsCollection
+          .find({ lessonId: { $in: stringIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...stringLessons2);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${stringLessons2.length} lessons by lessonId field`
+        );
+
+        if (stringLessons2.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = stringLessons2[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(
+            `   - lessonId: ${firstLesson.lessonId || "Not available"}`
+          );
+        }
+      } catch (error) {
+        console.error(`❌ Error in lessonId query: ${error.message}`);
+      }
+
+      console.log("\n📌 QUERY #4: Using string IDs for lesson_id field");
+      console.log(
+        `Query: db.Lessons.find({ "lesson_id": { $in: ["${stringIds.join('", "')}"] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const stringLessons3 = await lessonsCollection
+          .find({ lesson_id: { $in: stringIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...stringLessons3);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${stringLessons3.length} lessons by lesson_id field`
+        );
+
+        if (stringLessons3.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = stringLessons3[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(
+            `   - lesson_id: ${firstLesson.lesson_id || "Not available"}`
+          );
+        }
+      } catch (error) {
+        console.error(`❌ Error in lesson_id query: ${error.message}`);
+      }
+    }
+
+    // Try to find lessons using numeric IDs for various ID fields
+    if (numericIds.length > 0) {
+      console.log(
+        "\n📌 QUERY #5: Using numeric IDs for lesson.lesson_id field"
+      );
+      console.log(
+        `Query: db.Lessons.find({ "lesson.lesson_id": { $in: [${numericIds.join(", ")}] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const numericLessons1 = await lessonsCollection
+          .find({ "lesson.lesson_id": { $in: numericIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...numericLessons1);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${numericLessons1.length} lessons by lesson.lesson_id field as number`
+        );
+
+        if (numericLessons1.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = numericLessons1[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(
+            `   - lesson.lesson_id: ${firstLesson.lesson?.lesson_id || "Not available"}`
+          );
+        }
+      } catch (error) {
+        console.error(
+          `❌ Error in numeric lesson.lesson_id query: ${error.message}`
+        );
+      }
+
+      console.log("\n📌 QUERY #6: Using numeric IDs for lessonId field");
+      console.log(
+        `Query: db.Lessons.find({ "lessonId": { $in: [${numericIds.join(", ")}] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const numericLessons2 = await lessonsCollection
+          .find({ lessonId: { $in: numericIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...numericLessons2);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${numericLessons2.length} lessons by lessonId field as number`
+        );
+
+        if (numericLessons2.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = numericLessons2[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(
+            `   - lessonId: ${firstLesson.lessonId || "Not available"}`
+          );
+        }
+      } catch (error) {
+        console.error(`❌ Error in numeric lessonId query: ${error.message}`);
+      }
+
+      console.log("\n📌 QUERY #7: Using numeric IDs for lesson_id field");
+      console.log(
+        `Query: db.Lessons.find({ "lesson_id": { $in: [${numericIds.join(", ")}] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const numericLessons3 = await lessonsCollection
+          .find({ lesson_id: { $in: numericIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...numericLessons3);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${numericLessons3.length} lessons by lesson_id field as number`
+        );
+
+        if (numericLessons3.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = numericLessons3[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(
+            `   - lesson_id: ${firstLesson.lesson_id || "Not available"}`
+          );
+        }
+      } catch (error) {
+        console.error(`❌ Error in numeric lesson_id query: ${error.message}`);
+      }
+
+      // Additional query: Try _id field directly with numbers
+      console.log("\n📌 QUERY #8: Using numeric IDs for _id field directly");
+      console.log(
+        `Query: db.Lessons.find({ "_id": { $in: [${numericIds.join(", ")}] } })`
+      );
+
+      try {
+        const startTime = Date.now();
+        const numericLessons4 = await lessonsCollection
+          .find({ _id: { $in: numericIds } })
+          .toArray();
+        const queryTime = Date.now() - startTime;
+
+        lessonDocuments.push(...numericLessons4);
+        console.log(`✅ Query completed in ${queryTime}ms`);
+        console.log(
+          `✅ Found ${numericLessons4.length} lessons by _id field as number`
+        );
+
+        if (numericLessons4.length > 0) {
+          console.log("📄 First match details:");
+          const firstLesson = numericLessons4[0];
+          console.log(`   - _id: ${firstLesson._id}`);
+          console.log(`   - Type of _id: ${typeof firstLesson._id}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error in numeric _id query: ${error.message}`);
+      }
+    }
+
+    // Remove duplicates (in case a lesson was found by multiple methods)
+    console.log("\n🧹 DEDUPLICATION PROCESS 🧹");
+    console.log("==========================");
+    console.log(
+      `Total lessons found before deduplication: ${lessonDocuments.length}`
+    );
+
+    if (lessonDocuments.length > 0) {
+      console.log("IDs before deduplication:");
+      lessonDocuments.forEach((doc, index) => {
+        console.log(`  ${index + 1}. _id: ${doc._id}, type: ${typeof doc._id}`);
+      });
+    }
+
+    const uniqueLessons = lessonDocuments.filter((lesson, index, self) => {
+      const firstIndex = self.findIndex(
+        (l) => l._id.toString() === lesson._id.toString()
+      );
+      const isDuplicate = index !== firstIndex;
+      if (isDuplicate) {
+        console.log(
+          `  ↪️ Duplicate found: ${lesson._id} (index ${index} is duplicate of index ${firstIndex})`
+        );
+      }
+      return !isDuplicate;
+    });
+
+    console.log(
+      `✅ After deduplication: ${uniqueLessons.length} unique lessons (removed ${lessonDocuments.length - uniqueLessons.length} duplicates)`
+    );
 
     // Transform lessons to the format expected by the lesson engine
-    const lessons = lessonDocuments.map((doc) => ({
-      _id: doc._id,
-      lesson_title: doc.lesson.lesson_title,
-      lesson_description: doc.lesson.lesson_description,
-      lesson_type: doc.lesson.lesson_type,
-      lesson_blocks: doc.lesson.lesson_blocks || [],
-      lesson_conditions: doc.lesson.lesson_conditions || [],
-      intro_text_blocks: doc.lesson.intro_text_blocks || [],
-      teacher: doc.teacher,
-      unit: doc.unit,
-      createdAt: doc.createdAt,
-      updatedAt: doc.updatedAt,
-    }));
+    console.log("\n🔄 LESSON TRANSFORMATION 🔄");
+    console.log("==========================");
+
+    const lessons = uniqueLessons.map((doc, index) => {
+      // Log the document structure to help with debugging
+      console.log(
+        `\n📝 Processing lesson ${index + 1}/${uniqueLessons.length} with ID ${doc._id}:`
+      );
+      console.log(`  - Document fields: ${Object.keys(doc).join(", ")}`);
+
+      if (doc.lesson) {
+        console.log(
+          `  - Has 'lesson' property with fields: ${Object.keys(doc.lesson).join(", ")}`
+        );
+      } else {
+        console.log(
+          `  - No 'lesson' property found, using top-level properties`
+        );
+      }
+
+      // Safely extract properties, checking if they're in the doc or doc.lesson
+      const getLessonProperty = (propName, defaultValue = "") => {
+        if (doc[propName] !== undefined) {
+          console.log(`  - Found '${propName}' at top level`);
+          return doc[propName];
+        }
+        if (doc.lesson && doc.lesson[propName] !== undefined) {
+          console.log(`  - Found '${propName}' inside lesson property`);
+          return doc.lesson[propName];
+        }
+        console.log(
+          `  - '${propName}' not found, using default: ${defaultValue}`
+        );
+        return defaultValue;
+      };
+
+      const transformedLesson = {
+        _id: doc._id,
+        lesson: doc.lesson || {}, // Keep the original nested structure
+        lesson_title: getLessonProperty("lesson_title"),
+        lesson_description: getLessonProperty("lesson_description"),
+        lesson_type: getLessonProperty("lesson_type"),
+        lesson_blocks: getLessonProperty("lesson_blocks", []),
+        lesson_conditions: getLessonProperty("lesson_conditions", []),
+        intro_text_blocks: getLessonProperty("intro_text_blocks", []),
+        teacher: doc.teacher || "",
+        unit: doc.unit || "",
+        createdAt: doc.createdAt || new Date(),
+        updatedAt: doc.updatedAt || new Date(),
+      };
+
+      console.log(
+        `  ✅ Transformed lesson: ID=${transformedLesson._id}, Title=${transformedLesson.lesson_title || "(no title)"}`
+      );
+      return transformedLesson;
+    });
 
     // Log detailed lesson content for debugging
-    console.log("--- Lesson Content Summary ---");
+    console.log("\n📊 LESSON CONTENT SUMMARY 📊");
+    console.log("==========================");
     lessons.forEach((lesson, index) => {
-      console.log(`Lesson ${index + 1}: ${lesson.lesson_title}`);
-      console.log(`  - Blocks: ${lesson.lesson_blocks.length}`);
-      console.log(`  - Conditions: ${lesson.lesson_conditions.length}`);
-      console.log(`  - Intro blocks: ${lesson.intro_text_blocks.length}`);
+      const lessonId = lesson._id.toString();
+      const lessonTitle =
+        lesson.lesson_title || lesson.lesson?.lesson_title || "Unknown";
+      const lessonBlocks =
+        lesson.lesson_blocks || lesson.lesson?.lesson_blocks || [];
+      const lessonConditions =
+        lesson.lesson_conditions || lesson.lesson?.lesson_conditions || [];
+      const introBlocks =
+        lesson.intro_text_blocks || lesson.lesson?.intro_text_blocks || [];
+
+      console.log(`\n📚 Lesson ${index + 1}/${lessons.length}:`);
+      console.log(`  - ID: ${lessonId}`);
+      console.log(`  - Title: ${lessonTitle}`);
+      console.log(`  - Blocks: ${lessonBlocks.length}`);
+      console.log(`  - Conditions: ${lessonConditions.length}`);
+      console.log(`  - Intro blocks: ${introBlocks.length}`);
+
+      if (lessonBlocks.length > 0) {
+        console.log(
+          `  - First block type: ${lessonBlocks[0].type || "unknown"}`
+        );
+      }
     });
 
     res.json({
@@ -1847,8 +2297,19 @@ app.post("/get-lessons-by-ids", async (req, res) => {
       foundCount: lessons.length,
       message: `Retrieved ${lessons.length} of ${lessonIds.length} requested lessons`,
     });
+
+    console.log(
+      "RESPONSE SENT TO CLIENT: success=true, foundCount=" + lessons.length
+    );
+    console.log(
+      "*************************************************************\n\n"
+    );
   } catch (error) {
     console.error("Failed to fetch lessons by IDs:", error);
+    console.log("ERROR:", error.message);
+    console.log(
+      "*************************************************************\n\n"
+    );
     res.status(500).json({
       success: false,
       message: "Failed to fetch lessons: " + error.message,
@@ -1959,6 +2420,211 @@ app.get("/admin-lessons", async (req, res) => {
   }
 });
 
+// API endpoint to fetch lessons for a student by studentId (student name)
+app.get("/api/student-lessons/:studentId", async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    if (!studentId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Missing studentId" });
+    }
+
+    // Find the student's profile
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentId,
+    });
+
+    if (!studentProfile) {
+      console.log(`[LESSON API] No profile found for memberName: ${studentId}`);
+      return res
+        .status(404)
+        .json({ success: false, message: "Student not found" });
+    }
+
+    // Debug: Log the full student profile
+    console.log(
+      `[LESSON API] Full profile for ${studentId}:`,
+      JSON.stringify(studentProfile, null, 2)
+    );
+
+    // Debug: Log the student profile's assignedUnitIds
+    console.log(
+      `[LESSON API] Profile for ${studentId}: assignedUnitIds:`,
+      studentProfile.assignedUnitIds
+    );
+
+    // Collect all lessonIds from assignedUnitIds
+    const assignedUnits = Array.isArray(studentProfile.assignedUnitIds)
+      ? studentProfile.assignedUnitIds
+      : [];
+    console.log(
+      `[LESSON API] assignedUnits array:`,
+      JSON.stringify(assignedUnits, null, 2)
+    );
+    let allLessonIds = [];
+    assignedUnits.forEach((unit, idx) => {
+      console.log(`[LESSON API] Unit[${idx}]`, JSON.stringify(unit, null, 2));
+      if (Array.isArray(unit.lessonIds)) {
+        allLessonIds.push(...unit.lessonIds);
+      }
+    });
+
+    // Remove duplicates and filter falsy values
+    allLessonIds = [...new Set(allLessonIds)].filter(Boolean);
+    console.log(`[LESSON API] All lessonIds collected:`, allLessonIds);
+
+    if (allLessonIds.length === 0) {
+      console.log(`[LESSON API] No lessonIds found for student: ${studentId}`);
+      return res.status(200).json({
+        success: true,
+        lessons: [],
+        message: "No lessons assigned to student.",
+      });
+    }
+
+    // Fetch lessons from Lessons collection by _id (convert string IDs to ObjectId if possible)
+    const { ObjectId } = require("mongodb");
+    const studentLessonsCollection = client
+      .db("TrinityCapital")
+      .collection("Lessons");
+    // Convert all IDs to ObjectId if valid, else keep as string
+    const lessonIdQuery = allLessonIds.map((id) => {
+      // Convert to ObjectId if 24-char hex string
+      if (
+        typeof id === "string" &&
+        id.length === 24 &&
+        /^[a-fA-F0-9]+$/.test(id)
+      ) {
+        try {
+          return new ObjectId(id);
+        } catch (e) {
+          return id;
+        }
+      }
+      // Convert to number if numeric string
+      if (typeof id === "string" && /^\d+$/.test(id)) {
+        return Number(id);
+      }
+      return id;
+    });
+    const lessonDocs = await studentLessonsCollection
+      .find({
+        _id: { $in: lessonIdQuery },
+      })
+      .toArray();
+
+    // Debug: Log found lessons
+    console.log(
+      `[LESSON API] Found ${lessonDocs.length} lessons for student: ${studentId}`
+    );
+    lessonDocs.forEach((doc, idx) => {
+      console.log(
+        `[LESSON API] Lesson[${idx}]: _id=${doc._id}, title=${doc.lesson?.lesson_title}`
+      );
+    });
+
+    // Format lessons for frontend (flatten lesson object)
+    const lessons = lessonDocs.map((doc) => ({
+      _id: doc._id,
+      ...doc.lesson,
+    }));
+
+    console.log(
+      `[LESSON API] Returning ${lessons.length} lessons to frontend for student: ${studentId}`
+    );
+    res.status(200).json({
+      success: true,
+      lessons,
+      message: `Retrieved ${lessons.length} lessons for student.`,
+    });
+  } catch (error) {
+    console.error("Failed to fetch lessons for student:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch lessons for student.",
+    });
+  }
+});
+
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
+// Validate all routes to ensure they don't have path-to-regexp issues
+// This is for debugging purposes only - it won't fix the routes but will help identify issues
+function validateRoutes() {
+  const router = app._router;
+  if (!router) {
+    console.log("No router found on Express app");
+    return;
+  }
+
+  console.log("\n===== ROUTE VALIDATION =====");
+
+  // Get all routes from the Express router
+  const routes = router.stack
+    .filter((layer) => layer.route)
+    .map((layer) => {
+      const route = layer.route;
+      const methods = Object.keys(route.methods)
+        .map((m) => m.toUpperCase())
+        .join(",");
+      return {
+        path: route.path,
+        methods: methods || "UNKNOWN",
+        hasParams: route.path.includes(":"),
+      };
+    });
+
+  console.log(`Found ${routes.length} routes`);
+
+  // Check routes with parameters for potential issues
+  const routesWithParams = routes.filter((r) => r.hasParams);
+  console.log(`Found ${routesWithParams.length} routes with parameters`);
+
+  routesWithParams.forEach((route) => {
+    console.log(`- [${route.methods}] ${route.path}`);
+
+    // Check for common route parameter issues
+    if (route.path.includes("::")) {
+      console.error(`  ⚠️ WARNING: Double colons in route path: ${route.path}`);
+    }
+
+    if (route.path.includes(":") && route.path.includes("?")) {
+      console.error(
+        `  ⚠️ WARNING: Both colon and question mark in route path: ${route.path}`
+      );
+    }
+
+    // Split the path into segments and check each parameter
+    const segments = route.path.split("/");
+    segments.forEach((segment) => {
+      if (segment.startsWith(":")) {
+        const paramName = segment.substring(1);
+        if (!paramName || paramName.length === 0) {
+          console.error(
+            `  ⚠️ WARNING: Empty parameter name in route path: ${route.path}`
+          );
+        }
+        if (
+          paramName.includes(":") ||
+          paramName.includes("/") ||
+          paramName.includes("?")
+        ) {
+          console.error(
+            `  ⚠️ WARNING: Invalid character in parameter name '${paramName}' in route path: ${route.path}`
+          );
+        }
+      }
+    });
+  });
+
+  console.log("===== END ROUTE VALIDATION =====\n");
+}
+
+// Run validation after all routes are registered
+validateRoutes();
