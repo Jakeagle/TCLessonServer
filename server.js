@@ -794,7 +794,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
     // Define the master teacher whose content becomes default for all users
-    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
     // Fetch units from the teacher's document
     const teacherDocument = await teachersCollection.findOne(
@@ -1095,7 +1095,7 @@ app.post("/saveUnitChanges", async (req, res) => {
       .collection("Teachers");
 
     // Define the master teacher
-    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
     // Check if this is a default unit being edited by a non-master teacher
     if (unitData.isDefaultUnit && teacherName !== MASTER_TEACHER) {
