@@ -794,7 +794,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
     // Define the master teacher whose content becomes default for all users
-    const MASTER_TEACHER = "admin@trinity-capital.net";
+    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
 
     // Fetch units from the teacher's document
     const teacherDocument = await teachersCollection.findOne(
@@ -1095,7 +1095,7 @@ app.post("/saveUnitChanges", async (req, res) => {
       .collection("Teachers");
 
     // Define the master teacher
-    const MASTER_TEACHER = "admin@trinity-capital.net";
+    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
 
     // Check if this is a default unit being edited by a non-master teacher
     if (unitData.isDefaultUnit && teacherName !== MASTER_TEACHER) {
@@ -1200,7 +1200,7 @@ app.post("/create-custom-unit", async (req, res) => {
       .collection("Teachers");
 
     // Define the master teacher
-    const MASTER_TEACHER = "admin@trinity-capital.net";
+    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
 
     // Prepare the unit data
     const newUnit = {
@@ -1319,7 +1319,7 @@ app.post("/copy-default-unit", async (req, res) => {
     }
 
     // Define the master teacher
-    const MASTER_TEACHER = "admin@trinity-capital.net";
+    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
 
     if (teacherName === MASTER_TEACHER) {
       return res.status(400).json({
@@ -1579,7 +1579,7 @@ app.post("/lesson-management-update", async (req, res) => {
 });
 
 // New endpoint for students to get lessons for their class period
-// This always uses admin@trinity-capital.net's content as the default
+// This always uses trinitycapitalsim@gmail.com's content as the default
 app.get("/student-lessons/:classPeriod", async (req, res) => {
   try {
     const { classPeriod } = req.params;
@@ -1598,8 +1598,8 @@ app.get("/student-lessons/:classPeriod", async (req, res) => {
       .collection("Teachers");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    // Always use admin@trinity-capital.net as the master teacher for student content
-    const MASTER_TEACHER = "admin@trinity-capital.net";
+    // Always use trinitycapitalsim@gmail.com as the master teacher for student content
+    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
 
     // Get master teacher's units and find which unit is assigned to this class period
     const masterTeacherDocument = await teachersCollection.findOne(
@@ -1707,8 +1707,8 @@ app.get("/master-lessons", async (req, res) => {
       .collection("Teachers");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    // Always use admin@trinity-capital.net as the master teacher
-    const MASTER_TEACHER = "admin@trinity-capital.net";
+    // Always use trinitycapitalsim@gmail.com as the master teacher
+    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
 
     // Get master teacher's units
     const masterTeacherDocument = await teachersCollection.findOne(
@@ -2322,7 +2322,7 @@ app.post("/migrate-admin-ownership", async (req, res) => {
   try {
     console.log("--- Starting Admin Ownership Migration ---");
 
-    const ADMIN_TEACHER = "admin@trinity-capital.net";
+    const ADMIN_TEACHER = "trinitycapitalsim@gmail.com";
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
     const teachersCollection = client
       .db("TrinityCapital")
@@ -2389,20 +2389,20 @@ app.post("/migrate-admin-ownership", async (req, res) => {
   }
 });
 
-// Get lessons created by admin@trinity-capital.net for testing
+// Get lessons created by trinitycapitalsim@gmail.com for testing
 app.get("/admin-lessons", async (req, res) => {
   try {
     const lessons = await client
       .db("TrinityCapital")
       .collection("Lessons")
       .find({
-        teacher: "admin@trinity-capital.net",
+        teacher: "trinitycapitalsim@gmail.com",
       })
       .limit(10) // Limit to 10 lessons for testing
       .toArray();
 
     console.log(
-      `Found ${lessons.length} lessons created by admin@trinity-capital.net`
+      `Found ${lessons.length} lessons created by trinitycapitalsim@gmail.com`
     );
 
     res.json({
