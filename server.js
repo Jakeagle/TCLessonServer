@@ -8,7 +8,7 @@ const cors = require("cors");
 const port = process.env.PORT || 4000;
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",")
-  : ["http://localhost:3000"];
+  : ["http://localhost:4000"];
 const mongoUri =
   process.env.MONGODB_URI || "mongodb://localhost:27017/TrinityCapital";
 
@@ -1200,7 +1200,7 @@ app.post("/create-custom-unit", async (req, res) => {
       .collection("Teachers");
 
     // Define the master teacher
-    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
     // Prepare the unit data
     const newUnit = {
@@ -1319,7 +1319,7 @@ app.post("/copy-default-unit", async (req, res) => {
     }
 
     // Define the master teacher
-    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
     if (teacherName === MASTER_TEACHER) {
       return res.status(400).json({
@@ -1579,7 +1579,7 @@ app.post("/lesson-management-update", async (req, res) => {
 });
 
 // New endpoint for students to get lessons for their class period
-// This always uses trinitycapitalsim@gmail.com's content as the default
+// This always uses admin@trinity-capital.net's content as the default
 app.get("/student-lessons/:classPeriod", async (req, res) => {
   try {
     const { classPeriod } = req.params;
@@ -1598,8 +1598,8 @@ app.get("/student-lessons/:classPeriod", async (req, res) => {
       .collection("Teachers");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    // Always use trinitycapitalsim@gmail.com as the master teacher for student content
-    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
+    // Always use admin@trinity-capital.net as the master teacher for student content
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
     // Get master teacher's units and find which unit is assigned to this class period
     const masterTeacherDocument = await teachersCollection.findOne(
@@ -1707,8 +1707,8 @@ app.get("/master-lessons", async (req, res) => {
       .collection("Teachers");
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    // Always use trinitycapitalsim@gmail.com as the master teacher
-    const MASTER_TEACHER = "trinitycapitalsim@gmail.com";
+    // Always use admin@trinity-capital.net as the master teacher
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
     // Get master teacher's units
     const masterTeacherDocument = await teachersCollection.findOne(
@@ -2322,7 +2322,7 @@ app.post("/migrate-admin-ownership", async (req, res) => {
   try {
     console.log("--- Starting Admin Ownership Migration ---");
 
-    const ADMIN_TEACHER = "trinitycapitalsim@gmail.com";
+    const ADMIN_TEACHER = "admin@trinity-capital.net";
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
     const teachersCollection = client
       .db("TrinityCapital")
@@ -2389,20 +2389,20 @@ app.post("/migrate-admin-ownership", async (req, res) => {
   }
 });
 
-// Get lessons created by trinitycapitalsim@gmail.com for testing
+// Get lessons created by admin@trinity-capital.net for testing
 app.get("/admin-lessons", async (req, res) => {
   try {
     const lessons = await client
       .db("TrinityCapital")
       .collection("Lessons")
       .find({
-        teacher: "trinitycapitalsim@gmail.com",
+        teacher: "admin@trinity-capital.net",
       })
       .limit(10) // Limit to 10 lessons for testing
       .toArray();
 
     console.log(
-      `Found ${lessons.length} lessons created by trinitycapitalsim@gmail.com`
+      `Found ${lessons.length} lessons created by admin@trinity-capital.net`
     );
 
     res.json({
@@ -2417,6 +2417,121 @@ app.get("/admin-lessons", async (req, res) => {
       error: "Failed to fetch admin lessons",
       message: error.message,
     });
+  }
+});
+
+// API endpoint to fetch lessons for a student by studentId (student name) - for frontend
+app.get("/lessons", async (req, res) => {
+  try {
+    const { studentId } = req.query;
+    if (!studentId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Missing studentId" });
+    }
+
+    // Find the student's profile
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentId,
+    });
+
+    if (!studentProfile) {
+      console.log(`[LESSON API] No profile found for memberName: ${studentId}`);
+      return res
+        .status(404)
+        .json({ success: false, message: "Student not found" });
+    }
+
+    // Collect all lessonIds from assignedUnitIds
+    const assignedUnits = Array.isArray(studentProfile.assignedUnitIds)
+      ? studentProfile.assignedUnitIds
+      : [];
+    let allLessonIds = [];
+    assignedUnits.forEach((unit) => {
+      if (Array.isArray(unit.lessonIds)) {
+        allLessonIds.push(...unit.lessonIds);
+      }
+    });
+
+    // Remove duplicates and filter falsy values
+    allLessonIds = [...new Set(allLessonIds)].filter(Boolean);
+
+    if (allLessonIds.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // Fetch lessons from Lessons collection by _id
+    const { ObjectId } = require("mongodb");
+    const studentLessonsCollection = client
+      .db("TrinityCapital")
+      .collection("Lessons");
+    const lessonIdQuery = allLessonIds.map((id) => {
+      if (
+        typeof id === "string" &&
+        id.length === 24 &&
+        /^[a-fA-F0-9]+$/.test(id)
+      ) {
+        try {
+          return new ObjectId(id);
+        } catch (e) {
+          return id;
+        }
+      }
+      if (typeof id === "string" && /^\d+$/.test(id)) {
+        return Number(id);
+      }
+      return id;
+    });
+    const lessonDocs = await studentLessonsCollection
+      .find({
+        _id: { $in: lessonIdQuery },
+      })
+      .toArray();
+
+    // Format lessons for frontend
+    const lessons = lessonDocs.map((doc) => {
+      const getLessonProperty = (propName, defaultValue = "") => {
+        if (doc[propName] !== undefined) {
+          return doc[propName];
+        }
+        if (doc.lesson && doc.lesson[propName] !== undefined) {
+          return doc.lesson[propName];
+        }
+        return defaultValue;
+      };
+
+      return {
+        _id: doc._id,
+        lesson_title: getLessonProperty("lesson_title"),
+        lesson_description: getLessonProperty("lesson_description"),
+        lesson_type: getLessonProperty("lesson_type"),
+        content: getLessonProperty("content", []),
+        completion_conditions: getLessonProperty("lesson_conditions", []),
+        learning_objectives: getLessonProperty("learning_objectives", []),
+        unit: getLessonProperty("unit"),
+        teacher: getLessonProperty("teacher"),
+        createdAt: getLessonProperty("createdAt"),
+        dallas_fed_aligned: getLessonProperty("dallas_fed_aligned"),
+        teks_standards: getLessonProperty("teks_standards", []),
+        day: getLessonProperty("day"),
+        status: getLessonProperty("status"),
+        difficulty_level: getLessonProperty("difficulty_level"),
+        estimated_duration: getLessonProperty("estimated_duration"),
+        required_actions: getLessonProperty("required_actions", []),
+        success_metrics: getLessonProperty("success_metrics", {}),
+        updated_at: getLessonProperty("updated_at"),
+        condition_alignment: getLessonProperty("condition_alignment"),
+        structure_cleaned: getLessonProperty("structure_cleaned"),
+      };
+    });
+
+    res.status(200).json(lessons);
+  } catch (error) {
+    console.error("Failed to fetch lessons for student:", error);
+    res.status(500).json([]);
   }
 });
 
