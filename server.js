@@ -8,7 +8,7 @@ const cors = require("cors");
 const port = process.env.PORT || 4000;
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",")
-  : ["http://localhost:3000"];
+  : ["http://localhost:4000"];
 const mongoUri =
   process.env.MONGODB_URI || "mongodb://localhost:27017/TrinityCapital";
 
@@ -1578,6 +1578,65 @@ app.post("/lesson-management-update", async (req, res) => {
   }
 });
 
+app.post("/data", (req, res) => {
+  console.log("Received data:", req.body);
+  res.status(200).json({ success: true, message: "Data received and logged." });
+});
+
+app.post("/api/sdsm/session", async (req, res) => {
+  try {
+    const { studentName, activeLessons } = req.body;
+    if (!studentName || !activeLessons) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing studentName or activeLessons in request.",
+      });
+    }
+
+    console.log("Received student session data for:", studentName);
+    console.log("Session Data:", req.body);
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    // Use $addToSet with $each to add new lessons to the activeLessons array
+    // without creating duplicates. This will also create the "Lesson Data" object
+    // and the "activeLessons" array if they don't exist.
+    const updateResult = await profilesCollection.updateOne(
+      { memberName: studentName },
+      {
+        $addToSet: {
+          "Lesson Data.activeLessons": { $each: activeLessons },
+        },
+      }
+    );
+
+    if (updateResult.matchedCount === 0) {
+      console.log(`Student profile not found for: ${studentName}`);
+      return res
+        .status(404)
+        .json({ success: false, message: "Student profile not found." });
+    }
+
+    if (updateResult.modifiedCount > 0) {
+      console.log(
+        `Active lessons updated for ${studentName}.`,
+        updateResult.modifiedCount
+      );
+    } else {
+      console.log(`No new active lessons to add for ${studentName}.`);
+    }
+
+    res.status(200).json({ success: true, message: "Active lessons updated." });
+  } catch (error) {
+    console.error("Error processing SDSM session data:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to store session data." });
+  }
+});
+
 // New endpoint for students to get lessons for their class period
 // This always uses admin@trinity-capital.net's content as the default
 app.get("/student-lessons/:classPeriod", async (req, res) => {
@@ -2417,6 +2476,121 @@ app.get("/admin-lessons", async (req, res) => {
       error: "Failed to fetch admin lessons",
       message: error.message,
     });
+  }
+});
+
+// API endpoint to fetch lessons for a student by studentId (student name) - for frontend
+app.get("/lessons", async (req, res) => {
+  try {
+    const { studentId } = req.query;
+    if (!studentId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Missing studentId" });
+    }
+
+    // Find the student's profile
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentId,
+    });
+
+    if (!studentProfile) {
+      console.log(`[LESSON API] No profile found for memberName: ${studentId}`);
+      return res
+        .status(404)
+        .json({ success: false, message: "Student not found" });
+    }
+
+    // Collect all lessonIds from assignedUnitIds
+    const assignedUnits = Array.isArray(studentProfile.assignedUnitIds)
+      ? studentProfile.assignedUnitIds
+      : [];
+    let allLessonIds = [];
+    assignedUnits.forEach((unit) => {
+      if (Array.isArray(unit.lessonIds)) {
+        allLessonIds.push(...unit.lessonIds);
+      }
+    });
+
+    // Remove duplicates and filter falsy values
+    allLessonIds = [...new Set(allLessonIds)].filter(Boolean);
+
+    if (allLessonIds.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // Fetch lessons from Lessons collection by _id
+    const { ObjectId } = require("mongodb");
+    const studentLessonsCollection = client
+      .db("TrinityCapital")
+      .collection("Lessons");
+    const lessonIdQuery = allLessonIds.map((id) => {
+      if (
+        typeof id === "string" &&
+        id.length === 24 &&
+        /^[a-fA-F0-9]+$/.test(id)
+      ) {
+        try {
+          return new ObjectId(id);
+        } catch (e) {
+          return id;
+        }
+      }
+      if (typeof id === "string" && /^\d+$/.test(id)) {
+        return Number(id);
+      }
+      return id;
+    });
+    const lessonDocs = await studentLessonsCollection
+      .find({
+        _id: { $in: lessonIdQuery },
+      })
+      .toArray();
+
+    // Format lessons for frontend
+    const lessons = lessonDocs.map((doc) => {
+      const getLessonProperty = (propName, defaultValue = "") => {
+        if (doc[propName] !== undefined) {
+          return doc[propName];
+        }
+        if (doc.lesson && doc.lesson[propName] !== undefined) {
+          return doc.lesson[propName];
+        }
+        return defaultValue;
+      };
+
+      return {
+        _id: doc._id,
+        lesson_title: getLessonProperty("lesson_title"),
+        lesson_description: getLessonProperty("lesson_description"),
+        lesson_type: getLessonProperty("lesson_type"),
+        content: getLessonProperty("content", []),
+        completion_conditions: getLessonProperty("lesson_conditions", []),
+        learning_objectives: getLessonProperty("learning_objectives", []),
+        unit: getLessonProperty("unit"),
+        teacher: getLessonProperty("teacher"),
+        createdAt: getLessonProperty("createdAt"),
+        dallas_fed_aligned: getLessonProperty("dallas_fed_aligned"),
+        teks_standards: getLessonProperty("teks_standards", []),
+        day: getLessonProperty("day"),
+        status: getLessonProperty("status"),
+        difficulty_level: getLessonProperty("difficulty_level"),
+        estimated_duration: getLessonProperty("estimated_duration"),
+        required_actions: getLessonProperty("required_actions", []),
+        success_metrics: getLessonProperty("success_metrics", {}),
+        updated_at: getLessonProperty("updated_at"),
+        condition_alignment: getLessonProperty("condition_alignment"),
+        structure_cleaned: getLessonProperty("structure_cleaned"),
+      };
+    });
+
+    res.status(200).json(lessons);
+  } catch (error) {
+    console.error("Failed to fetch lessons for student:", error);
+    res.status(500).json([]);
   }
 });
 
