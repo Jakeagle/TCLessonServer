@@ -1583,6 +1583,178 @@ app.post("/data", (req, res) => {
   res.status(200).json({ success: true, message: "Data received and logged." });
 });
 
+app.post("/update-lesson-time", async (req, res) => {
+  try {
+    const { studentName, lessonId, elapsedTime } = req.body;
+
+    if (!studentName || !lessonId || elapsedTime === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: studentName, lessonId, elapsedTime",
+      });
+    }
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    // Find the student's profile
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentName,
+    });
+
+    if (!studentProfile) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Student profile not found." });
+    }
+
+    // --- Get existing time and add new time ---
+    const lessonData = studentProfile["Lesson Data"]?.find(
+      (ld) => ld.studentName === studentName
+    );
+    const existingElapsedTime =
+      lessonData?.lessonTimers?.[lessonId]?.elapsedTime || 0;
+    const newTotalElapsedTime = existingElapsedTime + Number(elapsedTime);
+    // --- End of new logic ---
+
+    // Format the time into M:SS
+    const minutes = Math.floor(newTotalElapsedTime / 60);
+    const seconds = Math.floor(newTotalElapsedTime % 60);
+    const formattedTime = `${minutes}:${seconds.toString().padStart(2, "0")}`;
+
+    // Update the database, assuming "Lesson Data" is an array and we're updating an element within it.
+    const updateResult = await profilesCollection.updateOne(
+      { memberName: studentName, "Lesson Data.studentName": studentName },
+      {
+        $set: {
+          "Lesson Data.$.lessonTimers.$[lessonId].elapsedTime":
+            newTotalElapsedTime,
+          "Lesson Data.$.lessonTimers.$[lessonId].elapsedMinutes":
+            formattedTime,
+          "Lesson Data.$.lessonTimers.$[lessonId].lastUpdated": new Date(),
+        },
+      },
+      {
+        arrayFilters: [{ lessonId: lessonId }],
+      }
+    );
+
+    if (updateResult.modifiedCount > 0) {
+      console.log(
+        `Updated lesson time for ${studentName}, lesson ${lessonId}. New total: ${formattedTime}`
+      );
+      res.status(200).json({
+        success: true,
+        message: "Lesson time updated successfully.",
+        totalElapsedTime: newTotalElapsedTime,
+        formattedTime: formattedTime,
+      });
+    } else {
+      console.log(
+        "No document was updated. Attempting to create new timer entry."
+      );
+
+      // If the update didn't work, try to create a new timer entry
+      const createResult = await profilesCollection.updateOne(
+        { memberName: studentName, "Lesson Data.studentName": studentName },
+        {
+          $set: {
+            "Lesson Data.$.lessonTimers": {
+              [lessonId]: {
+                elapsedTime: Number(elapsedTime),
+                elapsedMinutes: formattedTime,
+                lastUpdated: new Date(),
+              },
+            },
+          },
+        }
+      );
+
+      if (createResult.modifiedCount > 0) {
+        res.status(200).json({
+          success: true,
+          message: "New lesson timer created successfully.",
+          totalElapsedTime: Number(elapsedTime),
+          formattedTime: formattedTime,
+        });
+      } else {
+        res.status(500).json({
+          success: false,
+          message: "Failed to create or update lesson timer.",
+        });
+      }
+    }
+  } catch (error) {
+    console.error("Error updating lesson time:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update lesson time." });
+  }
+});
+
+// New endpoint to get existing lesson time for resuming timer
+app.get("/get-lesson-time/:studentName/:lessonId", async (req, res) => {
+  try {
+    const { studentName, lessonId } = req.params;
+
+    if (!studentName || !lessonId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required parameters: studentName, lessonId",
+      });
+    }
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    // Find the student's profile
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentName,
+    });
+
+    if (!studentProfile) {
+      return res.status(404).json({
+        success: false,
+        message: "Student profile not found.",
+      });
+    }
+
+    // Get existing time for this lesson
+    const lessonData = studentProfile["Lesson Data"]?.find(
+      (ld) => ld.studentName === studentName
+    );
+
+    const existingElapsedTime =
+      lessonData?.lessonTimers?.[lessonId]?.elapsedTime || 0;
+
+    const formattedTime =
+      lessonData?.lessonTimers?.[lessonId]?.elapsedMinutes || "0:00";
+    const lastUpdated = lessonData?.lessonTimers?.[lessonId]?.lastUpdated;
+
+    console.log(
+      `Retrieved lesson time for ${studentName}, lesson ${lessonId}: ${existingElapsedTime} seconds (${formattedTime})`
+    );
+
+    res.status(200).json({
+      success: true,
+      studentName: studentName,
+      lessonId: lessonId,
+      elapsedTime: existingElapsedTime,
+      formattedTime: formattedTime,
+      lastUpdated: lastUpdated,
+      message: "Lesson time retrieved successfully.",
+    });
+  } catch (error) {
+    console.error("Error retrieving lesson time:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve lesson time.",
+    });
+  }
+});
+
 app.post("/api/sdsm/session", async (req, res) => {
   try {
     const { studentName, activeLessons } = req.body;
@@ -1600,32 +1772,58 @@ app.post("/api/sdsm/session", async (req, res) => {
       .db("TrinityCapital")
       .collection("User Profiles");
 
-    // Use $addToSet with $each to add new lessons to the activeLessons array
-    // without creating duplicates. This will also create the "Lesson Data" object
-    // and the "activeLessons" array if they don't exist.
+    // Lesson Data is an array, so we handle it as such.
+    // First, try to update an existing session object in the "Lesson Data" array.
     const updateResult = await profilesCollection.updateOne(
+      { memberName: studentName, "Lesson Data.studentName": studentName },
+      {
+        $addToSet: { "Lesson Data.$.activeLessons": { $each: activeLessons } },
+      }
+    );
+
+    if (updateResult.matchedCount > 0) {
+      if (updateResult.modifiedCount > 0) {
+        console.log(
+          `Active lessons updated for ${studentName}.`,
+          updateResult.modifiedCount
+        );
+      } else {
+        console.log(`No new active lessons to add for ${studentName}.`);
+      }
+      return res
+        .status(200)
+        .json({ success: true, message: "Active lessons updated." });
+    }
+
+    // If no document was matched, it might be because the student has no session data sub-document yet.
+    // So, we try to push a new session object into the Lesson Data array.
+    const pushResult = await profilesCollection.updateOne(
       { memberName: studentName },
       {
-        $addToSet: {
-          "Lesson Data.activeLessons": { $each: activeLessons },
+        $push: {
+          "Lesson Data": {
+            studentName: studentName,
+            activeLessons: activeLessons,
+            lessonTimers: {},
+            timestamp: new Date(),
+          },
         },
       }
     );
 
-    if (updateResult.matchedCount === 0) {
+    if (pushResult.matchedCount === 0) {
+      // This means the student profile itself doesn't exist.
       console.log(`Student profile not found for: ${studentName}`);
       return res
         .status(404)
         .json({ success: false, message: "Student profile not found." });
     }
 
-    if (updateResult.modifiedCount > 0) {
-      console.log(
-        `Active lessons updated for ${studentName}.`,
-        updateResult.modifiedCount
-      );
+    if (pushResult.modifiedCount > 0) {
+      console.log(`Created and updated session data for ${studentName}.`);
     } else {
-      console.log(`No new active lessons to add for ${studentName}.`);
+      // This case is unlikely but could happen if the push fails for some reason.
+      console.log(`Failed to add new session data for ${studentName}.`);
     }
 
     res.status(200).json({ success: true, message: "Active lessons updated." });
