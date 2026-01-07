@@ -12,6 +12,11 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
 const mongoUri =
   process.env.MONGODB_URI || "mongodb://localhost:27017/TrinityCapital";
 
+console.log("========================================");
+console.log("🔗 MongoDB Connection URI:");
+console.log("   ", mongoUri);
+console.log("   (Check if this matches your MongoDB Atlas connection)");
+console.log("========================================");
 console.log("Configuring CORS with origins:", allowedOrigins);
 
 // Create a CORS middleware with specific options
@@ -1693,6 +1698,78 @@ app.post("/update-lesson-time", async (req, res) => {
   }
 });
 
+app.get("/api/timers", async (req, res) => {
+  try {
+    const { studentId, lessonId } = req.query;
+
+    if (!studentId || !lessonId) {
+      return res.status(400).json({
+        success: false,
+        message: "Student ID and Lesson ID are required.",
+      });
+    }
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentId,
+    });
+
+    if (!studentProfile) {
+      // If no profile, it's a new student for timer purposes.
+      console.log(
+        `No profile found for student ${studentId}. Returning default timer.`
+      );
+      return res.status(200).json({
+        success: true,
+        elapsedTime: 0,
+        formattedTime: "0:00",
+        message: "No existing timer found, starting new one.",
+      });
+    }
+
+    // Find lesson data for the student
+    const lessonData = studentProfile["Lesson Data"]?.find(
+      (ld) => ld.studentName === studentId
+    );
+
+    const timerData = lessonData?.lessonTimers?.[lessonId];
+
+    if (!timerData) {
+      console.log(
+        `No timer found for lesson ${lessonId} for student ${studentId}. Returning default timer.`
+      );
+      return res.status(200).json({
+        success: true,
+        elapsedTime: 0,
+        formattedTime: "0:00",
+        message: "No existing timer found, starting new one.",
+      });
+    }
+
+    console.log(
+      `Retrieved lesson timer for ${studentId}, lesson ${lessonId}: ${timerData.elapsedTime} seconds`
+    );
+
+    res.status(200).json({
+      success: true,
+      studentId: studentId,
+      lessonId: lessonId,
+      elapsedTime: timerData.elapsedTime,
+      formattedTime: timerData.elapsedMinutes,
+      lastUpdated: timerData.lastUpdated,
+    });
+  } catch (error) {
+    console.error("Could not fetch lesson timer:", error);
+    res.status(500).json({
+      success: false,
+      message: "Could not fetch lesson timer.",
+    });
+  }
+});
+
 // New endpoint to get existing lesson time for resuming timer
 app.get("/get-lesson-time/:studentName/:lessonId", async (req, res) => {
   try {
@@ -1757,11 +1834,17 @@ app.get("/get-lesson-time/:studentName/:lessonId", async (req, res) => {
 
 app.post("/api/sdsm/session", async (req, res) => {
   try {
-    const { studentName, activeLessons } = req.body;
-    if (!studentName || !activeLessons) {
+    const {
+      studentName,
+      activeLessons,
+      completedLessons,
+      lessonTimers,
+      timestamp,
+    } = req.body;
+    if (!studentName) {
       return res.status(400).json({
         success: false,
-        message: "Missing studentName or activeLessons in request.",
+        message: "Missing studentName in request.",
       });
     }
 
@@ -1772,61 +1855,205 @@ app.post("/api/sdsm/session", async (req, res) => {
       .db("TrinityCapital")
       .collection("User Profiles");
 
-    // Lesson Data is an array, so we handle it as such.
-    // First, try to update an existing session object in the "Lesson Data" array.
-    const updateResult = await profilesCollection.updateOne(
-      { memberName: studentName, "Lesson Data.studentName": studentName },
-      {
-        $addToSet: { "Lesson Data.$.activeLessons": { $each: activeLessons } },
-      }
+    // Prepare session data object
+    const sessionData = {
+      studentName: studentName,
+      timestamp: timestamp ? new Date(timestamp) : new Date(),
+    };
+
+    // Add active lessons if provided
+    if (activeLessons && Array.isArray(activeLessons)) {
+      sessionData.activeLessons = activeLessons;
+    }
+
+    // Add lesson timers if provided (though these are now saved separately)
+    if (lessonTimers && typeof lessonTimers === "object") {
+      sessionData.lessonTimers = lessonTimers;
+    }
+
+    // Handle completed lessons with snapshots
+    console.log("🔍 DEBUG: Checking completedLessons parameter...");
+    console.log("completedLessons type:", typeof completedLessons);
+    console.log("completedLessons is array?", Array.isArray(completedLessons));
+    console.log(
+      "completedLessons value:",
+      JSON.stringify(completedLessons, null, 2)
     );
 
-    if (updateResult.matchedCount > 0) {
-      if (updateResult.modifiedCount > 0) {
+    if (
+      completedLessons &&
+      Array.isArray(completedLessons) &&
+      completedLessons.length > 0
+    ) {
+      console.log(
+        `✅ Processing ${completedLessons.length} completed lessons for ${studentName}`
+      );
+
+      // Store completed lessons in the User Profiles document as an array
+      const completionRecords = completedLessons.map((completedLesson) => ({
+        lessonId: completedLesson.lessonId,
+        lessonTitle: completedLesson.lessonTitle,
+        completedAt: new Date(completedLesson.completedAt),
+        snapshot: completedLesson.snapshot,
+        sessionTimestamp: sessionData.timestamp,
+      }));
+
+      console.log(
+        "📝 Attempting to save completion records:",
+        JSON.stringify(completionRecords, null, 2)
+      );
+
+      // ⚠️ SNAPSHOT VALIDATION - Check if snapshot contains data
+      completionRecords.forEach((record, idx) => {
         console.log(
-          `Active lessons updated for ${studentName}.`,
-          updateResult.modifiedCount
+          `\n🔍 SNAPSHOT ANALYSIS FOR LESSON ${idx + 1}: "${record.lessonTitle}"`
         );
-      } else {
-        console.log(`No new active lessons to add for ${studentName}.`);
-      }
-      return res
-        .status(200)
-        .json({ success: true, message: "Active lessons updated." });
+        console.log("================================================");
+
+        if (!record.snapshot) {
+          console.log("❌ ERROR: Snapshot is missing or null!");
+          return;
+        }
+
+        const snapshot = record.snapshot;
+        console.log(`Snapshot type: ${typeof snapshot}`);
+        console.log(`Snapshot keys: ${Object.keys(snapshot).join(", ")}`);
+
+        // Check for bills and paychecks specifically
+        if (snapshot.bills !== undefined) {
+          console.log(`✅ Found 'bills' property`);
+          console.log(`   Type: ${typeof snapshot.bills}`);
+          console.log(`   Is array: ${Array.isArray(snapshot.bills)}`);
+          console.log(
+            `   Length: ${Array.isArray(snapshot.bills) ? snapshot.bills.length : "N/A"}`
+          );
+          if (Array.isArray(snapshot.bills) && snapshot.bills.length > 0) {
+            console.log(
+              `   Content: ${JSON.stringify(snapshot.bills, null, 2)}`
+            );
+          } else {
+            console.log(`   ⚠️ WARNING: bills array is EMPTY`);
+          }
+        } else {
+          console.log(`❌ ERROR: 'bills' property NOT FOUND in snapshot!`);
+        }
+
+        if (snapshot.paychecks !== undefined) {
+          console.log(`✅ Found 'paychecks' property`);
+          console.log(`   Type: ${typeof snapshot.paychecks}`);
+          console.log(`   Is array: ${Array.isArray(snapshot.paychecks)}`);
+          console.log(
+            `   Length: ${Array.isArray(snapshot.paychecks) ? snapshot.paychecks.length : "N/A"}`
+          );
+          if (
+            Array.isArray(snapshot.paychecks) &&
+            snapshot.paychecks.length > 0
+          ) {
+            console.log(
+              `   Content: ${JSON.stringify(snapshot.paychecks, null, 2)}`
+            );
+          } else {
+            console.log(`   ⚠️ WARNING: paychecks array is EMPTY`);
+          }
+        } else {
+          console.log(`❌ ERROR: 'paychecks' property NOT FOUND in snapshot!`);
+        }
+
+        // Show all properties in the snapshot for debugging
+        console.log(`\nAll snapshot properties:`);
+        Object.entries(snapshot).forEach(([key, value]) => {
+          if (
+            typeof value === "object" &&
+            value !== null &&
+            !Array.isArray(value)
+          ) {
+            console.log(
+              `  - ${key}: [object] with keys ${Object.keys(value).join(", ")}`
+            );
+          } else if (Array.isArray(value)) {
+            console.log(`  - ${key}: [array] length ${value.length}`);
+          } else {
+            console.log(
+              `  - ${key}: ${typeof value} = ${String(value).substring(0, 50)}`
+            );
+          }
+        });
+
+        console.log("================================================\n");
+      });
+
+      sessionData.completedLessonsCount = completedLessons.length;
+      // Add completed lessons to sessionData to be saved in one operation
+      sessionData.completedLessons = completionRecords;
+
+      console.log(
+        `✅ Prepared ${completionRecords.length} completion snapshots to be saved with session data`
+      );
     }
 
-    // If no document was matched, it might be because the student has no session data sub-document yet.
-    // So, we try to push a new session object into the Lesson Data array.
-    const pushResult = await profilesCollection.updateOne(
-      { memberName: studentName },
-      {
-        $push: {
-          "Lesson Data": {
-            studentName: studentName,
-            activeLessons: activeLessons,
-            lessonTimers: {},
-            timestamp: new Date(),
-          },
-        },
-      }
-    );
+    // Update or create session data in user profile (includes completedLessons if present)
+    const updateData = {
+      $push: {
+        "Lesson Data": sessionData,
+      },
+      $set: {
+        lastSessionUpdate: sessionData.timestamp,
+      },
+    };
 
-    if (pushResult.matchedCount === 0) {
-      // This means the student profile itself doesn't exist.
-      console.log(`Student profile not found for: ${studentName}`);
-      return res
-        .status(404)
-        .json({ success: false, message: "Student profile not found." });
+    // Add completedLessons to root level if they exist
+    if (
+      completedLessons &&
+      Array.isArray(completedLessons) &&
+      completedLessons.length > 0
+    ) {
+      const completionRecords = completedLessons.map((completedLesson) => ({
+        lessonId: completedLesson.lessonId,
+        lessonTitle: completedLesson.lessonTitle,
+        completedAt: new Date(completedLesson.completedAt),
+        snapshot: completedLesson.snapshot,
+        sessionTimestamp: sessionData.timestamp,
+      }));
+
+      updateData.$push.completedLessons = { $each: completionRecords };
     }
 
-    if (pushResult.modifiedCount > 0) {
-      console.log(`Created and updated session data for ${studentName}.`);
+    try {
+      const updateResult = await profilesCollection.updateOne(
+        { memberName: studentName },
+        updateData,
+        { upsert: true }
+      );
+
+      console.log("✅ MongoDB updateOne result:", {
+        matchedCount: updateResult.matchedCount,
+        modifiedCount: updateResult.modifiedCount,
+        upsertedId: updateResult.upsertedId,
+        acknowledged: updateResult.acknowledged,
+      });
+    } catch (mongoError) {
+      console.error("❌ MongoDB Error saving completion records:", mongoError);
+      throw mongoError;
+    }
+
+    const updateResult = {
+      acknowledged: true,
+    };
+
+    if (updateResult.acknowledged) {
+      console.log(`Session data stored for ${studentName}`);
+      res.status(200).json({
+        success: true,
+        message: "Session data stored successfully",
+        completedLessonsStored: completedLessons ? completedLessons.length : 0,
+      });
     } else {
-      // This case is unlikely but could happen if the push fails for some reason.
-      console.log(`Failed to add new session data for ${studentName}.`);
+      console.error("Failed to store session data");
+      res.status(500).json({
+        success: false,
+        message: "Failed to store session data",
+      });
     }
-
-    res.status(200).json({ success: true, message: "Active lessons updated." });
   } catch (error) {
     console.error("Error processing SDSM session data:", error);
     res
