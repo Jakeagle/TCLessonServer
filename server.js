@@ -32,7 +32,7 @@ app.use(
       "X-Requested-With",
       "Accept",
     ],
-  })
+  }),
 );
 app.use(express.json());
 
@@ -55,7 +55,7 @@ app.options("*", (req, res) => {
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Origin, X-Requested-With, Accept"
+    "Content-Type, Authorization, Origin, X-Requested-With, Accept",
   );
   res.header("Access-Control-Allow-Credentials", "true");
   res.status(200).end();
@@ -143,7 +143,7 @@ async function run() {
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
+      "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } finally {
     // // Ensures that the client will close when you finish/error
@@ -156,19 +156,39 @@ app.post("/save-lesson", async (req, res) => {
   try {
     const { lesson, unit, teacher } = req.body;
 
-    // --- 1. Save the lesson to the "Lessons" collection (for flat searching) ---
+    // --- 1. Save the lesson to the "Lessons" collection with proper structure ---
+    // Store all fields at the top level for proper retrieval by student frontend
     const lessonDocument = {
+      _id: Date.now(), // Generate numeric ID
       teacher,
       unit,
-      lesson,
+      // Top-level fields (what student frontend expects)
+      lesson_title: lesson.lesson_title || "",
+      lesson_description: lesson.lesson_description || "",
+      content: lesson.content || [],
+      lesson_blocks: lesson.lesson_blocks || [],
+      intro_text_blocks: lesson.intro_text_blocks || [],
+      learning_objectives: lesson.learning_objectives || [],
+      lesson_conditions: lesson.lesson_conditions || [],
+      required_actions: lesson.required_actions || [],
+      success_metrics: lesson.success_metrics || {},
+      teks_standards: lesson.teks_standards || [],
+      day: lesson.day,
+      status: lesson.status || "active",
+      difficulty_level: lesson.difficulty_level,
+      estimated_duration: lesson.estimated_duration,
+      dallas_fed_aligned: lesson.dallas_fed_aligned,
+      condition_alignment: lesson.condition_alignment,
+      structure_cleaned: lesson.structure_cleaned,
       createdAt: new Date(),
     };
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
     const lessonInsertResult =
       await lessonsCollection.insertOne(lessonDocument);
+    const numericLessonId = lessonDocument._id.toString();
 
     console.log(
-      `Lesson saved to 'Lessons' collection with id: ${lessonInsertResult.insertedId}`
+      `Lesson saved to 'Lessons' collection with id: ${numericLessonId}`,
     );
 
     // --- 2. Update the teacher's document in the "Teachers" collection ---
@@ -176,48 +196,147 @@ app.post("/save-lesson", async (req, res) => {
       .db("TrinityCapital")
       .collection("Teachers");
 
-    // Create lesson object with the MongoDB-generated _id
-    const lessonWithId = {
-      ...lesson,
-      _id: lessonInsertResult.insertedId.toString(), // Convert ObjectId to string for consistency
+    // Create MINIMAL lesson reference object - only _id, lesson_title, lesson_description
+    // Full content will be fetched from Lessons collection when needed
+    const lessonReference = {
+      _id: numericLessonId,
+      lesson_title: lesson.lesson_title || "",
+      lesson_description: lesson.lesson_description || "",
     };
 
-    // Step 2a: Try to push the lesson into an existing unit's 'lessons' array.
+    // Step 2a: Try to push the lesson into an existing unit's 'lessons' array
+    // Use unit.name to find the unit since that's what's displayed to users
+    console.log(`🔍 Looking for unit by name: "${unit.name}"`);
+
     const updateResult = await teachersCollection.updateOne(
-      { name: teacher, "units.value": unit.value },
-      { $push: { "units.$.lessons": lessonWithId } }
+      { name: teacher, "units.name": unit.name },
+      { $push: { "units.$.lessons": lessonReference } },
+    );
+
+    console.log(
+      `✓ Save lesson - Update result: matched=${updateResult.matchedCount}, modified=${updateResult.modifiedCount}`,
     );
 
     // Step 2b: If the unit didn't exist for that teacher, add the new unit to the teacher's 'units' array.
     if (updateResult.matchedCount === 0) {
+      console.warn(
+        `⚠️ Unit '${unit.name}' not found for teacher '${teacher}'. Creating new unit...`,
+      );
       // This update handles cases where the 'units' array exists but the specific unit doesn't,
       // or where the 'units' array doesn't exist at all.
       const addUnitResult = await teachersCollection.updateOne(
         { name: teacher },
-        { $push: { units: { ...unit, lessons: [lessonWithId] } } }
+        { $push: { units: { ...unit, lessons: [lessonReference] } } },
+      );
+
+      console.log(
+        `✓ Save lesson - Add unit result: matched=${addUnitResult.matchedCount}, modified=${addUnitResult.modifiedCount}`,
       );
 
       // If this second update also fails to find a match, it means the teacher doesn't exist.
       if (addUnitResult.matchedCount === 0) {
-        console.warn(
-          `Teacher '${teacher}' not found in 'Teachers' collection. Lesson was saved to 'Lessons' but not added to a teacher profile.`
+        console.error(
+          `❌ Teacher '${teacher}' not found in 'Teachers' collection. Lesson was saved to 'Lessons' but not added to teacher profile.`,
         );
       }
     }
 
     console.log(
-      `Lesson added to unit '${unit.name}' for teacher '${teacher}'.`
+      `✅ Lesson "${lesson.lesson_title}" saved to unit "${unit.name}" for teacher "${teacher}"`,
+    );
+
+    // --- 3. Assign lesson to all students with this teacher ---
+    console.log(`\n📚 ASSIGNING LESSON TO STUDENTS:`);
+    console.log(`Looking for students with teacher: "${teacher}"`);
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    // Use the numeric ID of the lesson (already a string)
+    console.log(`Lesson numeric ID: ${numericLessonId}`);
+
+    // Find all students assigned to this teacher
+    const studentsWithTeacher = await profilesCollection
+      .find({ teacher: teacher })
+      .toArray();
+
+    console.log(
+      `Found ${studentsWithTeacher.length} students assigned to teacher "${teacher}"`,
+    );
+
+    // Update each student to add this lesson to their unit's lessonIds
+    if (studentsWithTeacher.length > 0) {
+      for (const student of studentsWithTeacher) {
+        // Check if student has assignedUnitIds
+        if (
+          student.assignedUnitIds &&
+          Array.isArray(student.assignedUnitIds) &&
+          student.assignedUnitIds.length > 0
+        ) {
+          // Find the unit assignment that matches this unit
+          const unitAssignmentIndex = student.assignedUnitIds.findIndex(
+            (assignment) =>
+              assignment.unitName === unit.name ||
+              assignment.unitValue === unit.value,
+          );
+
+          if (unitAssignmentIndex !== -1) {
+            // Unit assignment found - add lesson to lessonIds
+            console.log(
+              `  ✓ Adding lesson to student "${student.memberName}" in unit "${unit.name}"`,
+            );
+
+            // Ensure lessonIds array exists
+            if (
+              !student.assignedUnitIds[unitAssignmentIndex].lessonIds ||
+              !Array.isArray(
+                student.assignedUnitIds[unitAssignmentIndex].lessonIds,
+              )
+            ) {
+              student.assignedUnitIds[unitAssignmentIndex].lessonIds = [];
+            }
+
+            // Add the lesson ID if it's not already there (keep as string for consistency)
+            if (
+              !student.assignedUnitIds[unitAssignmentIndex].lessonIds.includes(
+                numericLessonId,
+              )
+            ) {
+              student.assignedUnitIds[unitAssignmentIndex].lessonIds.push(
+                numericLessonId,
+              );
+
+              // Update the student profile
+              await profilesCollection.updateOne(
+                { memberName: student.memberName },
+                { $set: { assignedUnitIds: student.assignedUnitIds } },
+              );
+            }
+          } else {
+            console.log(
+              `  ⚠️ Student "${student.memberName}" not assigned to unit "${unit.name}"`,
+            );
+          }
+        } else {
+          console.log(
+            `  ⚠️ Student "${student.memberName}" has no assigned units`,
+          );
+        }
+      }
+    }
+
+    console.log(
+      `✅ Lesson assignment to students completed for unit "${unit.name}"\n`,
     );
 
     // --- Fetch updated unit data from database before emitting events ---
     const updatedTeacherDoc = await teachersCollection.findOne(
       { name: teacher },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
-    res
-      .status(201)
-      .json({ success: true, lessonId: lessonInsertResult.insertedId });
+    res.status(201).json({ success: true, lessonId: numericLessonId });
   } catch (error) {
     console.error("Failed to save lesson:", error);
     res.status(500).json({ success: false, message: "Failed to save lesson." });
@@ -234,23 +353,173 @@ app.post("/update-lesson", async (req, res) => {
     console.log("Lesson ID:", lessonId);
     console.log("Lesson Title:", lesson.lesson_title);
 
-    // Import ObjectId for MongoDB operations
     const { ObjectId } = require("mongodb");
-
-    // --- 1. Update the lesson in the "Lessons" collection ---
     const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
 
-    const lessonUpdateResult = await lessonsCollection.updateOne(
-      { _id: new ObjectId(lessonId) },
-      {
-        $set: {
-          "lesson.lesson_title": lesson.lesson_title,
-          "lesson.lesson_description": lesson.lesson_description,
-          "lesson.lesson_blocks": lesson.lesson_blocks,
-          "lesson.lesson_conditions": lesson.lesson_conditions,
-          updatedAt: new Date(),
-        },
+    // Parse lesson ID
+    let query = {};
+    const numericId = parseInt(lessonId, 10);
+
+    if (!isNaN(numericId)) {
+      query = { _id: numericId };
+    } else {
+      try {
+        query = { _id: new ObjectId(lessonId) };
+      } catch (e) {
+        query = { _id: lessonId };
       }
+    }
+
+    console.log("Query for lesson update:", query);
+
+    // --- FETCH EXISTING LESSON FIRST ---
+    // This ensures we preserve ALL existing data that isn't being updated
+    const existingLesson = await lessonsCollection.findOne(query);
+
+    if (!existingLesson) {
+      return res.status(404).json({
+        success: false,
+        message: "Lesson not found - cannot update non-existent lesson",
+      });
+    }
+
+    // Get the existing lesson object (or empty if doesn't exist)
+    const existingLessonData = existingLesson.lesson || {};
+
+    // --- SAFE MERGE: Only override fields that are explicitly provided ---
+    // This preserves lesson_blocks, intro_text_blocks, and any other existing data
+    const lessonDocument = {
+      _id: numericId || lessonId,
+      lesson: {
+        // Preserve existing fields first
+        ...existingLessonData,
+        // Then override only with provided fields
+        lesson_title:
+          lesson.lesson_title !== undefined
+            ? lesson.lesson_title
+            : existingLessonData.lesson_title || "",
+        lesson_description:
+          lesson.lesson_description !== undefined
+            ? lesson.lesson_description
+            : existingLessonData.lesson_description || "",
+        unit:
+          lesson.unit !== undefined
+            ? lesson.unit
+            : existingLessonData.unit || unit.name || "",
+        content:
+          lesson.content !== undefined
+            ? lesson.content
+            : existingLessonData.content || [],
+        lesson_blocks:
+          lesson.lesson_blocks !== undefined
+            ? lesson.lesson_blocks
+            : existingLessonData.lesson_blocks || [],
+        intro_text_blocks:
+          lesson.intro_text_blocks !== undefined
+            ? lesson.intro_text_blocks
+            : existingLessonData.intro_text_blocks || [],
+        learning_objectives:
+          lesson.learning_objectives !== undefined
+            ? lesson.learning_objectives
+            : existingLessonData.learning_objectives || [],
+        creator_email:
+          lesson.creator_email !== undefined
+            ? lesson.creator_email
+            : existingLessonData.creator_email || teacher,
+        creator_username:
+          lesson.creator_username !== undefined
+            ? lesson.creator_username
+            : existingLessonData.creator_username || "adminTC",
+        teacher:
+          lesson.teacher !== undefined
+            ? lesson.teacher
+            : existingLessonData.teacher || teacher,
+        createdAt: existingLessonData.createdAt || new Date(),
+        dallas_fed_aligned:
+          lesson.dallas_fed_aligned !== undefined
+            ? typeof lesson.dallas_fed_aligned === "boolean"
+              ? lesson.dallas_fed_aligned
+              : existingLessonData.dallas_fed_aligned !== undefined
+                ? existingLessonData.dallas_fed_aligned
+                : true
+            : existingLessonData.dallas_fed_aligned !== undefined
+              ? existingLessonData.dallas_fed_aligned
+              : true,
+        teks_standards:
+          lesson.teks_standards !== undefined
+            ? lesson.teks_standards
+            : existingLessonData.teks_standards || [],
+        day:
+          lesson.day !== undefined
+            ? lesson.day
+            : existingLessonData.day || null,
+        status:
+          lesson.status !== undefined
+            ? lesson.status
+            : existingLessonData.status || "active",
+        difficulty_level:
+          lesson.difficulty_level !== undefined
+            ? lesson.difficulty_level
+            : existingLessonData.difficulty_level || null,
+        estimated_duration:
+          lesson.estimated_duration !== undefined
+            ? lesson.estimated_duration
+            : existingLessonData.estimated_duration || null,
+        condition_alignment:
+          lesson.condition_alignment !== undefined
+            ? lesson.condition_alignment
+            : existingLessonData.condition_alignment ||
+              "teacher_dashboard_compatible",
+        structure_cleaned: true,
+        updatedAt: new Date(),
+        lesson_conditions: (
+          lesson.lesson_conditions ||
+          existingLessonData.lesson_conditions ||
+          []
+        ).map((cond) => ({
+          condition_type: cond.condition_type,
+          condition_value:
+            cond.condition_value !== null && cond.condition_value !== undefined
+              ? cond.condition_value
+              : cond.value,
+          action_type: cond.action_type || null,
+          ...(cond.action_details && { action_details: cond.action_details }),
+          ...(cond.action && { action: cond.action }),
+        })),
+        required_actions:
+          lesson.required_actions ||
+          (
+            lesson.lesson_conditions ||
+            existingLessonData.lesson_conditions ||
+            []
+          ).map((c) => c.condition_type),
+        success_metrics: lesson.success_metrics ||
+          existingLessonData.success_metrics || {
+            minimum_conditions_met: Math.max(
+              Math.floor(
+                (
+                  lesson.lesson_conditions ||
+                  existingLessonData.lesson_conditions ||
+                  []
+                ).length * 0.66,
+              ),
+              2,
+            ),
+            time_limit_minutes: 30,
+            engagement_score_minimum: 60,
+            updated_at: new Date(),
+            condition_alignment: "teacher_dashboard_compatible",
+            structure_cleaned: true,
+          },
+      },
+      teacher: lesson.teacher || existingLesson.teacher || teacher,
+      unit: lesson.unit || existingLesson.unit || unit.name || "",
+      createdAt: existingLesson.createdAt || new Date(),
+    };
+
+    const lessonUpdateResult = await lessonsCollection.replaceOne(
+      query,
+      lessonDocument,
     );
 
     if (lessonUpdateResult.matchedCount === 0) {
@@ -260,80 +529,121 @@ app.post("/update-lesson", async (req, res) => {
       });
     }
 
-    console.log("Lesson updated in 'Lessons' collection");
+    console.log(
+      "✅ Lesson updated in 'Lessons' collection with STRICT nested structure",
+    );
 
-    // --- 2. Update the lesson in the teacher's "Teachers" collection ---
+    // --- 2. Update minimal reference in Teachers collection ---
     const teachersCollection = client
       .db("TrinityCapital")
       .collection("Teachers");
 
-    // Update the lesson in the specific unit's lessons array
+    const lessonReference = {
+      _id: lessonId.toString(),
+      lesson_title: lesson.lesson_title || "",
+      lesson_description: lesson.lesson_description || "",
+    };
+
+    console.log(
+      `🔍 Looking for lesson to update in unit "${unit.name}" with ID ${lessonId}`,
+    );
+
     const teacherUpdateResult = await teachersCollection.updateOne(
       {
         name: teacher,
-        "units.value": unit.value,
-        "units.lessons._id": lessonId,
+        "units.name": unit.name,
+        "units.lessons._id": lessonId.toString(),
       },
       {
         $set: {
-          "units.$[unit].lessons.$[lesson].lesson_title": lesson.lesson_title,
-          "units.$[unit].lessons.$[lesson].lesson_description":
-            lesson.lesson_description,
-          "units.$[unit].lessons.$[lesson].lesson_blocks": lesson.lesson_blocks,
-          "units.$[unit].lessons.$[lesson].lesson_conditions":
-            lesson.lesson_conditions,
+          "units.$[unit].lessons.$[lesson]": lessonReference,
         },
       },
       {
         arrayFilters: [
-          { "unit.value": unit.value },
-          { "lesson._id": lessonId },
+          { "unit.name": unit.name },
+          { "lesson._id": lessonId.toString() },
         ],
-      }
+      },
     );
 
     console.log(
-      "Teacher lesson update result:",
-      teacherUpdateResult.matchedCount > 0 ? "Success" : "Not found"
+      `✓ Update lesson reference in Teachers - matched=${teacherUpdateResult.matchedCount}, modified=${teacherUpdateResult.modifiedCount}`,
     );
 
-    // --- 3. Fetch updated unit data ---
-    const updatedTeacherDoc = await teachersCollection.findOne(
-      { name: teacher },
-      { projection: { units: 1, _id: 0 } }
-    );
-
-    let updatedUnit = null;
-    if (updatedTeacherDoc && updatedTeacherDoc.units) {
-      updatedUnit = updatedTeacherDoc.units.find((u) => u.value === unit.value);
+    // If lesson wasn't found, add it
+    if (teacherUpdateResult.matchedCount === 0) {
+      console.log(
+        `⚠️ Lesson not found in unit "${unit.name}". Adding as new reference...`,
+      );
+      const addLessonResult = await teachersCollection.updateOne(
+        { name: teacher, "units.name": unit.name },
+        { $push: { "units.$.lessons": lessonReference } },
+      );
+      console.log(
+        `✓ Add lesson reference - matched=${addLessonResult.matchedCount}, modified=${addLessonResult.modifiedCount}`,
+      );
     }
 
-    const unitToEmit = updatedUnit || unit;
+    // --- 3. Assign lesson to students ---
+    console.log(`\n📚 ASSIGNING UPDATED LESSON TO STUDENTS:`);
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+    const lessonIdString = lessonId.toString();
 
-    // --- 4. Emit Socket.IO events ---
+    const studentsWithTeacher = await profilesCollection
+      .find({ teacher: teacher })
+      .toArray();
+    console.log(
+      `Found ${studentsWithTeacher.length} students assigned to teacher "${teacher}"`,
+    );
+
+    if (studentsWithTeacher.length > 0) {
+      for (const student of studentsWithTeacher) {
+        if (
+          student.assignedUnitIds &&
+          Array.isArray(student.assignedUnitIds) &&
+          student.assignedUnitIds.length > 0
+        ) {
+          const unitAssignmentIndex = student.assignedUnitIds.findIndex(
+            (assignment) =>
+              assignment.unitName === unit.name ||
+              assignment.unitValue === unit.value,
+          );
+
+          if (unitAssignmentIndex !== -1) {
+            console.log(
+              `  ✓ Adding updated lesson to student "${student.memberName}"`,
+            );
+            if (!student.assignedUnitIds[unitAssignmentIndex].lessonIds) {
+              student.assignedUnitIds[unitAssignmentIndex].lessonIds = [];
+            }
+            if (
+              !student.assignedUnitIds[unitAssignmentIndex].lessonIds.includes(
+                lessonIdString,
+              )
+            ) {
+              student.assignedUnitIds[unitAssignmentIndex].lessonIds.push(
+                lessonIdString,
+              );
+              await profilesCollection.updateOne(
+                { memberName: student.memberName },
+                { $set: { assignedUnitIds: student.assignedUnitIds } },
+              );
+            }
+          }
+        }
+      }
+    }
+
+    console.log(`✅ Lesson update assignment completed\n`);
+
     io.emit("lessonUpdated", {
       teacherName: teacher,
-      lessonData: {
-        _id: lessonId,
-        ...lesson,
-      },
-      unitData: unitToEmit,
+      lessonData: { _id: lessonId, ...lesson },
+      unitData: unit,
     });
-
-    io.emit("lessonManagementRefresh", {
-      teacherName: teacher,
-      action: "lessonUpdated",
-      lessonData: {
-        _id: lessonId,
-        ...lesson,
-      },
-      unitData: unitToEmit,
-    });
-
-    console.log("--- Socket events emitted for lesson update ---");
-    console.log(`Teacher: ${teacher}`);
-    console.log(`Unit: ${unitToEmit.name} (${unitToEmit.value})`);
-    console.log(`Updated Lesson: ${lesson.lesson_title}`);
 
     res.status(200).json({
       success: true,
@@ -345,6 +655,118 @@ app.post("/update-lesson", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to update lesson: " + error.message,
+    });
+  }
+});
+
+// PRODUCTION: Fetch any lesson by ID (for editing admin-created lessons)
+// PRODUCTION: Fetch any lesson by numeric ID (for editing admin-created lessons)
+// Returns the complete lesson object with all content from Lessons collection
+app.get("/lesson/:lessonId", async (req, res) => {
+  try {
+    const { lessonId } = req.params;
+
+    console.log("--- Get Lesson by ID Request ---");
+    console.log("Lesson ID:", lessonId);
+
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Try to find lesson by numeric ID first
+    let numericId = parseInt(lessonId, 10);
+    let lesson = null;
+
+    if (!isNaN(numericId)) {
+      // If it's a valid number, search by numeric _id
+      lesson = await lessonsCollection.findOne({
+        _id: numericId,
+      });
+    }
+
+    // If not found as numeric, try as string or ObjectId
+    if (!lesson) {
+      const { ObjectId } = require("mongodb");
+      try {
+        lesson = await lessonsCollection.findOne({
+          _id: new ObjectId(lessonId),
+        });
+      } catch (e) {
+        // Not a valid ObjectId, try as string
+        lesson = await lessonsCollection.findOne({
+          _id: lessonId,
+        });
+      }
+    }
+
+    if (!lesson) {
+      console.log(`Lesson not found: ${lessonId}`);
+      return res.status(404).json({
+        success: false,
+        message: "Lesson not found",
+      });
+    }
+
+    // Return the complete lesson object with all content
+    // The lesson object contains everything: lesson_blocks, lesson_conditions, intro_text_blocks, etc.
+    // Note: lesson_conditions may be at top level OR inside lesson.lesson
+    const completeLesson = {
+      _id: lesson._id,
+      teacher: lesson.teacher,
+      unit: lesson.unit,
+      createdAt: lesson.createdAt,
+      updatedAt: lesson.updatedAt,
+      // Include ALL lesson content properties from nested lesson object
+      ...(lesson.lesson || {}),
+      // Also include top-level properties that might not be in lesson.lesson
+      // (handles both storage formats)
+      ...(lesson.lesson_conditions && {
+        lesson_conditions: lesson.lesson_conditions,
+      }),
+      ...(lesson.content && { content: lesson.content }),
+      ...(lesson.learning_objectives && {
+        learning_objectives: lesson.learning_objectives,
+      }),
+      ...(lesson.lesson_blocks && { lesson_blocks: lesson.lesson_blocks }),
+      ...(lesson.intro_text_blocks && {
+        intro_text_blocks: lesson.intro_text_blocks,
+      }),
+      ...(lesson.required_actions && {
+        required_actions: lesson.required_actions,
+      }),
+      ...(lesson.success_metrics && {
+        success_metrics: lesson.success_metrics,
+      }),
+    };
+
+    console.log(
+      `Retrieved complete lesson: ${completeLesson.lesson_title || "Untitled"}`,
+    );
+    console.log(
+      `Lesson has ${completeLesson.lesson_blocks ? completeLesson.lesson_blocks.length : 0} blocks`,
+    );
+    console.log(
+      `Lesson has ${completeLesson.content ? completeLesson.content.length : 0} content items`,
+    );
+    console.log(
+      `Lesson has ${completeLesson.lesson_conditions ? completeLesson.lesson_conditions.length : 0} conditions`,
+    );
+    console.log(
+      "🔍 DEBUG: Complete lesson fields being sent:",
+      Object.keys(completeLesson),
+    );
+    console.log(
+      "🔍 DEBUG: lesson_conditions value:",
+      completeLesson.lesson_conditions,
+    );
+
+    res.status(200).json({
+      success: true,
+      lesson: completeLesson,
+    });
+  } catch (error) {
+    console.error("Failed to fetch lesson:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch lesson: " + error.message,
     });
   }
 });
@@ -413,12 +835,12 @@ app.post("/upload-whirlpool", (req, res) => {
     if (lesson) {
       console.log(
         "Lesson to be uploaded to Whirlpool:",
-        JSON.stringify(lesson, null, 2)
+        JSON.stringify(lesson, null, 2),
       );
     } else {
       console.log(
         "Received data for Whirlpool, but 'lesson' object not found. Full body:",
-        JSON.stringify(req.body, null, 2)
+        JSON.stringify(req.body, null, 2),
       );
     }
     console.log("------------------------------------------");
@@ -449,7 +871,7 @@ app.post("/test-lesson", async (req, res) => {
     }
 
     console.log(
-      `Searching for lesson with Title: "${lessonTitle}", Unit: "${unitName}", Teacher: "${teacher}"`
+      `Searching for lesson with Title: "${lessonTitle}", Unit: "${unitName}", Teacher: "${teacher}"`,
     );
 
     // Construct the query to find the specific lesson
@@ -506,13 +928,13 @@ app.post("/assign-unit", async (req, res) => {
     // This ensures a class period is only assigned to one unit at a time.
     await teachersCollection.updateOne(
       { name: teacherName, "units.assigned_to_period": classPeriod },
-      { $unset: { "units.$.assigned_to_period": "" } }
+      { $unset: { "units.$.assigned_to_period": "" } },
     );
 
     // Step 2: Assign the period to the selected unit.
     const updateResult = await teachersCollection.updateOne(
       { name: teacherName, "units.value": unitValue },
-      { $set: { "units.$.assigned_to_period": classPeriod } }
+      { $set: { "units.$.assigned_to_period": classPeriod } },
     );
 
     if (updateResult.matchedCount === 0) {
@@ -524,7 +946,7 @@ app.post("/assign-unit", async (req, res) => {
     // Step 3: Fetch the unit that was just assigned.
     const teacherDoc = await teachersCollection.findOne(
       { name: teacherName },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
     if (!teacherDoc || !teacherDoc.units) {
@@ -536,7 +958,7 @@ app.post("/assign-unit", async (req, res) => {
 
     // Find the unit that is now assigned to the class period.
     const assignedUnit = teacherDoc.units.find(
-      (u) => u.assigned_to_period === classPeriod
+      (u) => u.assigned_to_period === classPeriod,
     );
 
     if (!assignedUnit) {
@@ -552,7 +974,7 @@ app.post("/assign-unit", async (req, res) => {
     console.log("Unit Value:", assignedUnit.value);
     console.log(
       "Lesson References:",
-      assignedUnit.lessons ? assignedUnit.lessons.length : 0
+      assignedUnit.lessons ? assignedUnit.lessons.length : 0,
     );
 
     // DEBUG: Check the lesson structure
@@ -577,11 +999,11 @@ app.post("/assign-unit", async (req, res) => {
         if (lesson._id) {
           lessonIds.push(lesson._id);
           console.log(
-            `✓ Lesson "${lesson.lesson_title}" has ID: ${lesson._id}`
+            `✓ Lesson "${lesson.lesson_title}" has ID: ${lesson._id}`,
           );
         } else {
           console.log(
-            `⚠ Lesson "${lesson.lesson_title}" missing _id - will try to find in Lessons collection`
+            `⚠ Lesson "${lesson.lesson_title}" missing _id - will try to find in Lessons collection`,
           );
 
           // Try to find this lesson in the Lessons collection by matching content
@@ -597,7 +1019,7 @@ app.post("/assign-unit", async (req, res) => {
 
             if (foundLesson) {
               console.log(
-                `✓ Found matching lesson in Lessons collection with ID: ${foundLesson._id}`
+                `✓ Found matching lesson in Lessons collection with ID: ${foundLesson._id}`,
               );
               lessonIds.push(foundLesson._id.toString());
 
@@ -619,20 +1041,20 @@ app.post("/assign-unit", async (req, res) => {
                     { "unit.value": assignedUnit.value },
                     { "lesson.lesson_title": lesson.lesson_title },
                   ],
-                }
+                },
               );
               console.log(
-                `✓ Updated teacher's unit with missing _id for lesson: ${lesson.lesson_title}`
+                `✓ Updated teacher's unit with missing _id for lesson: ${lesson.lesson_title}`,
               );
             } else {
               console.log(
-                `✗ Could not find lesson "${lesson.lesson_title}" in Lessons collection`
+                `✗ Could not find lesson "${lesson.lesson_title}" in Lessons collection`,
               );
             }
           } catch (error) {
             console.error(
               `Error looking up lesson "${lesson.lesson_title}":`,
-              error
+              error,
             );
           }
         }
@@ -652,10 +1074,10 @@ app.post("/assign-unit", async (req, res) => {
     console.log("--- ObjectID-based Unit Assignment ---");
     console.log(
       "Unit Assignment Object:",
-      JSON.stringify(unitAssignment, null, 2)
+      JSON.stringify(unitAssignment, null, 2),
     );
     console.log(
-      `Will assign ${unitAssignment.lessonIds.length} lesson ObjectIDs to students`
+      `Will assign ${unitAssignment.lessonIds.length} lesson ObjectIDs to students`,
     );
 
     // DEBUG: Show what happened during lessonIds creation
@@ -688,14 +1110,14 @@ app.post("/assign-unit", async (req, res) => {
     const studentsToUpdate = await profilesCollection
       .find(
         { teacher: teacherName, classPeriod: classPeriodAsNumber },
-        { projection: { memberName: 1, _id: 0 } }
+        { projection: { memberName: 1, _id: 0 } },
       )
       .toArray();
 
     console.log("--- Students to be updated ---");
     console.log(
       `Found ${studentsToUpdate.length} students:`,
-      studentsToUpdate.map((s) => s.memberName)
+      studentsToUpdate.map((s) => s.memberName),
     );
 
     // Step 4: Update students with ObjectID-based assignment (remove duplicates)
@@ -705,17 +1127,17 @@ app.post("/assign-unit", async (req, res) => {
         $addToSet: {
           assignedUnitIds: unitAssignment, // Use addToSet to prevent duplicates
         },
-      }
+      },
     );
 
     console.log(
-      `✅ ASSIGNED UNIT REFERENCES to ${studentUpdateResult.modifiedCount} students`
+      `✅ ASSIGNED UNIT REFERENCES to ${studentUpdateResult.modifiedCount} students`,
     );
     console.log(
-      `Each student now has ObjectID references for unit: ${assignedUnit.name}`
+      `Each student now has ObjectID references for unit: ${assignedUnit.name}`,
     );
     console.log(
-      `Lesson ObjectIDs assigned: ${unitAssignment.lessonIds.join(", ")}`
+      `Lesson ObjectIDs assigned: ${unitAssignment.lessonIds.join(", ")}`,
     );
 
     // --- Emit Socket.IO events ---
@@ -758,7 +1180,7 @@ app.post("/assign-unit", async (req, res) => {
     });
 
     console.log(
-      `✅ Emitted unitAssignedToStudent events for ${studentsToUpdate.length} students`
+      `✅ Emitted unitAssignedToStudent events for ${studentsToUpdate.length} students`,
     );
     studentsToUpdate.forEach((student) => {
       console.log(`  - Notified student: ${student.memberName}`);
@@ -804,7 +1226,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
     // Fetch units from the teacher's document
     const teacherDocument = await teachersCollection.findOne(
       { name: teacherName },
-      { projection: { units: 1, _id: 0 } } // Only get the units field, exclude _id
+      { projection: { units: 1, _id: 0 } }, // Only get the units field, exclude _id
     );
 
     // Fetch master teacher's content as defaults
@@ -817,13 +1239,13 @@ app.get("/lessons/:teacherName", async (req, res) => {
       // Get master teacher's units
       const masterTeacherDocument = await teachersCollection.findOne(
         { name: MASTER_TEACHER },
-        { projection: { units: 1, _id: 0 } }
+        { projection: { units: 1, _id: 0 } },
       );
 
       if (masterTeacherDocument && masterTeacherDocument.units) {
         masterUnits = masterTeacherDocument.units;
         console.log(
-          `Found ${masterUnits.length} master units from ${MASTER_TEACHER}.`
+          `Found ${masterUnits.length} master units from ${MASTER_TEACHER}.`,
         );
       }
 
@@ -843,7 +1265,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
       }));
 
       console.log(
-        `Found ${masterLessons.length} master lessons from ${MASTER_TEACHER}.`
+        `Found ${masterLessons.length} master lessons from ${MASTER_TEACHER}.`,
       );
     }
 
@@ -879,7 +1301,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
 
         // Add default units that haven't been replaced by custom units
         const customUnitValues = new Set(
-          teacherUnits.map((unit) => unit.value)
+          teacherUnits.map((unit) => unit.value),
         );
         const remainingDefaultUnits = masterUnits
           .filter((unit) => !customUnitValues.has(unit.value))
@@ -891,7 +1313,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
         combinedUnits.push(...remainingDefaultUnits);
 
         console.log(
-          `Using teacher's ${teacherUnits.length} custom units + ${remainingDefaultUnits.length} remaining default units`
+          `Using teacher's ${teacherUnits.length} custom units + ${remainingDefaultUnits.length} remaining default units`,
         );
       } else {
         // Teacher has no units yet - show master units as defaults
@@ -900,7 +1322,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
           isDefaultUnit: true, // Flag to indicate this is a default unit
         }));
         console.log(
-          `Teacher has no units yet, showing ${masterUnits.length} default units from ${MASTER_TEACHER}`
+          `Teacher has no units yet, showing ${masterUnits.length} default units from ${MASTER_TEACHER}`,
         );
       }
     }
@@ -920,8 +1342,8 @@ app.get("/lessons/:teacherName", async (req, res) => {
             (masterLesson) =>
               !teacherFlattenedLessons.some(
                 (teacherLesson) =>
-                  teacherLesson.lesson_title === masterLesson.lesson_title
-              )
+                  teacherLesson.lesson_title === masterLesson.lesson_title,
+              ),
           ), // Add master lessons that don't conflict with teacher's lessons
         ];
       } else {
@@ -931,7 +1353,7 @@ app.get("/lessons/:teacherName", async (req, res) => {
           isDefaultLesson: true, // Flag to indicate this is a default lesson
         }));
         console.log(
-          `Teacher has no lessons yet, showing ${masterLessons.length} default lessons from ${MASTER_TEACHER}`
+          `Teacher has no lessons yet, showing ${masterLessons.length} default lessons from ${MASTER_TEACHER}`,
         );
       }
     }
@@ -952,45 +1374,121 @@ app.get("/lessons/:teacherName", async (req, res) => {
     });
 
     console.log(
-      `Found ${allLessonIds.size} unique lesson IDs to populate across all units`
+      `Found ${allLessonIds.size} unique lesson IDs to populate across all units`,
     );
 
     // Fetch all required lessons in bulk
     const { ObjectId } = require("mongodb");
-    const lessonIdsArray = Array.from(allLessonIds).map(
-      (id) => new ObjectId(id)
-    );
 
-    const fullLessonObjects = await lessonsCollection
-      .find({ _id: { $in: lessonIdsArray } })
-      .toArray();
+    // Helper function to check if a string is a valid MongoDB ObjectId hex string
+    const isValidObjectIdHex = (str) => {
+      return typeof str === "string" && /^[0-9a-f]{24}$/i.test(str);
+    };
+
+    // Helper function to check if a string is a valid numeric ID
+    const isNumericId = (str) => {
+      return !isNaN(str) && str.trim() !== "";
+    };
+
+    // Build query to fetch lessons - handle multiple ID formats
+    const objectIdArray = [];
+    const numericIdArray = [];
+
+    Array.from(allLessonIds).forEach((id) => {
+      if (isValidObjectIdHex(id)) {
+        try {
+          objectIdArray.push(new ObjectId(id));
+        } catch (e) {
+          console.log(`⚠️ Failed to convert to ObjectId: ${id}`);
+        }
+      } else if (isNumericId(id)) {
+        numericIdArray.push(parseInt(id, 10));
+      }
+    });
 
     console.log(
-      `Fetched ${fullLessonObjects.length} full lesson objects from database`
+      `📊 ID Processing: ${objectIdArray.length} ObjectIds, ${numericIdArray.length} numeric IDs`,
     );
 
-    // Create a lookup map for quick access
+    // Fetch lessons with both ID types
+    const fullLessonObjects = [];
+
+    // Query by ObjectIds
+    if (objectIdArray.length > 0) {
+      const objectIdResults = await lessonsCollection
+        .find({ _id: { $in: objectIdArray } })
+        .toArray();
+      fullLessonObjects.push(...objectIdResults);
+    }
+
+    // Query by numeric IDs
+    if (numericIdArray.length > 0) {
+      const numericIdResults = await lessonsCollection
+        .find({ _id: { $in: numericIdArray } })
+        .toArray();
+      fullLessonObjects.push(...numericIdResults);
+    }
+
+    console.log(
+      `Fetched ${fullLessonObjects.length} full lesson objects from database`,
+    );
+
+    // Create a lookup map for quick access - handle both string and ObjectId formats
     const lessonLookup = {};
     fullLessonObjects.forEach((lessonDoc) => {
-      lessonLookup[lessonDoc._id.toString()] = {
+      // Store by string representation of ID
+      const idString = lessonDoc._id.toString();
+
+      // Build complete lesson object from nested lesson data
+      const completeLesson = {
         _id: lessonDoc._id,
-        ...lessonDoc.lesson, // This includes lesson_blocks, lesson_conditions, etc.
+        teacher: lessonDoc.teacher,
+        unit: lessonDoc.unit,
+        createdAt: lessonDoc.createdAt,
+        updatedAt: lessonDoc.updatedAt,
+        // Spread nested lesson object properties
+        ...(lessonDoc.lesson || {}),
+        // Also include top-level content fields if they exist
+        ...(lessonDoc.content && { content: lessonDoc.content }),
+        ...(lessonDoc.lesson_conditions && {
+          lesson_conditions: lessonDoc.lesson_conditions,
+        }),
+        ...(lessonDoc.intro_text_blocks && {
+          intro_text_blocks: lessonDoc.intro_text_blocks,
+        }),
+        ...(lessonDoc.learning_objectives && {
+          learning_objectives: lessonDoc.learning_objectives,
+        }),
       };
+
+      lessonLookup[idString] = completeLesson;
+      console.log(
+        `🔍 Indexed lesson: ${completeLesson.lesson_title || "Unknown"} with ID ${idString}`,
+      );
     });
+
+    console.log(
+      `📊 Lesson lookup map created with ${Object.keys(lessonLookup).length} entries`,
+    );
 
     // Replace lesson references with full lesson objects in all units
     combinedUnits.forEach((unit) => {
       if (unit.lessons) {
         unit.lessons = unit.lessons.map((lessonRef) => {
+          // Handle both ObjectId and string formats
           const lessonId = lessonRef._id ? lessonRef._id.toString() : null;
+
           if (lessonId && lessonLookup[lessonId]) {
             console.log(
-              `✅ Populated full lesson object for: ${lessonLookup[lessonId].lesson_title}`
+              `✅ Populated full lesson object for: ${lessonLookup[lessonId].lesson_title}`,
             );
             return lessonLookup[lessonId];
           } else {
             console.log(
-              `⚠️ Could not find full lesson object for lesson: ${lessonRef.lesson_title || "Unknown"}`
+              `⚠️ Could not find full lesson object for lesson ID: ${lessonId} (ref: ${lessonRef.lesson_title || "Unknown"})`,
+            );
+            console.log(
+              `   Available IDs in lookup: ${Object.keys(lessonLookup).slice(0, 3).join(", ")}...`,
             );
             return lessonRef; // Return reference as fallback
           }
@@ -1005,37 +1503,37 @@ app.get("/lessons/:teacherName", async (req, res) => {
     combinedUnits.forEach((unit, unitIndex) => {
       console.log(`Unit ${unitIndex + 1}: ${unit.name} (${unit.value})`);
       console.log(
-        `  - Lessons count: ${unit.lessons ? unit.lessons.length : 0}`
+        `  - Lessons count: ${unit.lessons ? unit.lessons.length : 0}`,
       );
       if (unit.lessons && unit.lessons.length > 0) {
         unit.lessons.forEach((lesson, lessonIndex) => {
           console.log(
-            `    Lesson ${lessonIndex + 1}: ${lesson.lesson_title || "NO TITLE"}`
+            `    Lesson ${lessonIndex + 1}: ${lesson.lesson_title || "NO TITLE"}`,
           );
           console.log(`      - Has lesson_blocks: ${!!lesson.lesson_blocks}`);
           console.log(
-            `      - lesson_blocks count: ${lesson.lesson_blocks ? lesson.lesson_blocks.length : 0}`
+            `      - lesson_blocks count: ${lesson.lesson_blocks ? lesson.lesson_blocks.length : 0}`,
           );
           console.log(
-            `      - Has lesson_conditions: ${!!lesson.lesson_conditions}`
+            `      - Has lesson_conditions: ${!!lesson.lesson_conditions}`,
           );
           console.log(
-            `      - lesson_conditions count: ${lesson.lesson_conditions ? lesson.lesson_conditions.length : 0}`
+            `      - lesson_conditions count: ${lesson.lesson_conditions ? lesson.lesson_conditions.length : 0}`,
           );
           console.log(
-            `      - Has intro_text_blocks: ${!!lesson.intro_text_blocks}`
+            `      - Has intro_text_blocks: ${!!lesson.intro_text_blocks}`,
           );
           console.log(
-            `      - intro_text_blocks count: ${lesson.intro_text_blocks ? lesson.intro_text_blocks.length : 0}`
+            `      - intro_text_blocks count: ${lesson.intro_text_blocks ? lesson.intro_text_blocks.length : 0}`,
           );
           console.log(
-            `      - All lesson keys: ${Object.keys(lesson).join(", ")}`
+            `      - All lesson keys: ${Object.keys(lesson).join(", ")}`,
           );
 
           // Log the first few characters of the complete lesson object
           const lessonStr = JSON.stringify(lesson);
           console.log(
-            `      - Complete lesson (first 200 chars): ${lessonStr.substring(0, 200)}...`
+            `      - Complete lesson (first 200 chars): ${lessonStr.substring(0, 200)}...`,
           );
         });
       }
@@ -1044,17 +1542,17 @@ app.get("/lessons/:teacherName", async (req, res) => {
     console.log(`Final result for ${teacherName}:`);
     if (teacherName === MASTER_TEACHER) {
       console.log(
-        `- ${combinedUnits.length} own units, ${combinedLessons.length} own lessons (master teacher)`
+        `- ${combinedUnits.length} own units, ${combinedLessons.length} own lessons (master teacher)`,
       );
     } else if (teacherUnits.length > 0) {
       const customUnits = combinedUnits.filter((u) => !u.isDefaultUnit).length;
       const defaultUnits = combinedUnits.filter((u) => u.isDefaultUnit).length;
       console.log(
-        `- ${combinedUnits.length} total units (${customUnits} custom + ${defaultUnits} default), ${combinedLessons.length} total lessons (${teacherFlattenedLessons.length} own + ${masterLessons.length} master available)`
+        `- ${combinedUnits.length} total units (${customUnits} custom + ${defaultUnits} default), ${combinedLessons.length} total lessons (${teacherFlattenedLessons.length} own + ${masterLessons.length} master available)`,
       );
     } else {
       console.log(
-        `- ${combinedUnits.length} default units, ${combinedLessons.length} default lessons (from ${MASTER_TEACHER})`
+        `- ${combinedUnits.length} default units, ${combinedLessons.length} default lessons (from ${MASTER_TEACHER})`,
       );
     }
 
@@ -1105,7 +1603,7 @@ app.post("/saveUnitChanges", async (req, res) => {
     // Check if this is a default unit being edited by a non-master teacher
     if (unitData.isDefaultUnit && teacherName !== MASTER_TEACHER) {
       console.log(
-        `Teacher ${teacherName} attempted to edit default unit. Blocking with guidance message.`
+        `Teacher ${teacherName} attempted to edit default unit. Blocking with guidance message.`,
       );
       return res.status(403).json({
         success: false,
@@ -1119,7 +1617,7 @@ app.post("/saveUnitChanges", async (req, res) => {
     // update the master teacher's document instead
     if (unitData.isDefaultUnit && teacherName === MASTER_TEACHER) {
       console.log(
-        `Master teacher editing default unit - updating master document`
+        `Master teacher editing default unit - updating master document`,
       );
       // Remove the isDefaultUnit flag before saving
       const cleanUnitData = { ...unitData };
@@ -1127,7 +1625,7 @@ app.post("/saveUnitChanges", async (req, res) => {
 
       const updateResult = await teachersCollection.updateOne(
         { name: MASTER_TEACHER, "units.value": cleanUnitData.value },
-        { $set: { "units.$": cleanUnitData } }
+        { $set: { "units.$": cleanUnitData } },
       );
 
       if (updateResult.matchedCount === 0) {
@@ -1140,7 +1638,7 @@ app.post("/saveUnitChanges", async (req, res) => {
       // Normal case: teacher editing their own unit
       const updateResult = await teachersCollection.updateOne(
         { name: teacherName, "units.value": unitData.value },
-        { $set: { "units.$": unitData } }
+        { $set: { "units.$": unitData } },
       );
 
       if (updateResult.matchedCount === 0) {
@@ -1218,19 +1716,19 @@ app.post("/create-custom-unit", async (req, res) => {
     // Check if teacher already has this unit
     const teacherDocument = await teachersCollection.findOne(
       { name: teacherName },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
     if (teacherDocument && teacherDocument.units) {
       const existingUnitIndex = teacherDocument.units.findIndex(
-        (unit) => unit.value === unitData.value
+        (unit) => unit.value === unitData.value,
       );
 
       if (existingUnitIndex !== -1) {
         // Replace existing unit (could be default or custom)
         const updateResult = await teachersCollection.updateOne(
           { name: teacherName, "units.value": unitData.value },
-          { $set: { "units.$": newUnit } }
+          { $set: { "units.$": newUnit } },
         );
 
         if (updateResult.matchedCount === 0) {
@@ -1241,13 +1739,13 @@ app.post("/create-custom-unit", async (req, res) => {
         }
 
         console.log(
-          `Replaced existing unit ${unitData.value} for teacher ${teacherName}`
+          `Replaced existing unit ${unitData.value} for teacher ${teacherName}`,
         );
       } else {
         // Add new unit
         const addResult = await teachersCollection.updateOne(
           { name: teacherName },
-          { $push: { units: newUnit } }
+          { $push: { units: newUnit } },
         );
 
         if (addResult.matchedCount === 0) {
@@ -1258,14 +1756,14 @@ app.post("/create-custom-unit", async (req, res) => {
         }
 
         console.log(
-          `Added new unit ${unitData.value} for teacher ${teacherName}`
+          `Added new unit ${unitData.value} for teacher ${teacherName}`,
         );
       }
     } else {
       // Teacher has no units array yet, create it with this unit
       const addResult = await teachersCollection.updateOne(
         { name: teacherName },
-        { $set: { units: [newUnit] } }
+        { $set: { units: [newUnit] } },
       );
 
       if (addResult.matchedCount === 0) {
@@ -1276,7 +1774,7 @@ app.post("/create-custom-unit", async (req, res) => {
       }
 
       console.log(
-        `Created first unit ${unitData.value} for teacher ${teacherName}`
+        `Created first unit ${unitData.value} for teacher ${teacherName}`,
       );
     }
 
@@ -1334,7 +1832,7 @@ app.post("/copy-default-unit", async (req, res) => {
     }
 
     console.log(
-      `Copying default unit "${unitValue}" for teacher: "${teacherName}"`
+      `Copying default unit "${unitValue}" for teacher: "${teacherName}"`,
     );
 
     const teachersCollection = client
@@ -1345,7 +1843,7 @@ app.post("/copy-default-unit", async (req, res) => {
     // Get the master teacher's unit
     const masterTeacherDocument = await teachersCollection.findOne(
       { name: MASTER_TEACHER },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
     if (!masterTeacherDocument || !masterTeacherDocument.units) {
@@ -1356,7 +1854,7 @@ app.post("/copy-default-unit", async (req, res) => {
     }
 
     const masterUnit = masterTeacherDocument.units.find(
-      (unit) => unit.value === unitValue
+      (unit) => unit.value === unitValue,
     );
 
     if (!masterUnit) {
@@ -1405,7 +1903,7 @@ app.post("/copy-default-unit", async (req, res) => {
     await teachersCollection.updateOne(
       { name: teacherName },
       { $push: { units: newUnit } },
-      { upsert: true }
+      { upsert: true },
     );
 
     // Copy all lessons from the master teacher to the new teacher
@@ -1437,12 +1935,12 @@ app.post("/copy-default-unit", async (req, res) => {
 
       await teachersCollection.updateOne(
         { name: teacherName, "units.value": unitValue },
-        { $set: { "units.$.lessons": lessonReferences } }
+        { $set: { "units.$.lessons": lessonReferences } },
       );
     }
 
     console.log(
-      `Successfully copied unit "${masterUnit.name}" with ${copiedLessons.length} lessons to teacher ${teacherName}`
+      `Successfully copied unit "${masterUnit.name}" with ${copiedLessons.length} lessons to teacher ${teacherName}`,
     );
 
     res.status(200).json({
@@ -1482,7 +1980,7 @@ app.post("/refresh-lesson-management", async (req, res) => {
     // Get updated units
     const teacherDocument = await teachersCollection.findOne(
       { name: teacherName },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
     // Get all lessons
@@ -1500,7 +1998,7 @@ app.post("/refresh-lesson-management", async (req, res) => {
       teacherDocument && teacherDocument.units ? teacherDocument.units : [];
 
     console.log(
-      `Refreshing data: ${units.length} units, ${flattenedLessons.length} lessons`
+      `Refreshing data: ${units.length} units, ${flattenedLessons.length} lessons`,
     );
 
     // Emit comprehensive refresh event
@@ -1519,7 +2017,7 @@ app.post("/refresh-lesson-management", async (req, res) => {
         units: units,
         lessons: flattenedLessons,
         timestamp: new Date().toISOString(),
-      }
+      },
     );
 
     res.status(200).json({
@@ -1548,7 +2046,7 @@ app.post("/lesson-management-update", async (req, res) => {
     }
 
     console.log(
-      `Lesson management update for teacher: ${teacherName}, action: ${action}`
+      `Lesson management update for teacher: ${teacherName}, action: ${action}`,
     );
 
     // Emit specific event for lesson management modal updates
@@ -1602,53 +2100,51 @@ app.post("/update-lesson-time", async (req, res) => {
     const profilesCollection = client
       .db("TrinityCapital")
       .collection("User Profiles");
-
-    // Find the student's profile
     const studentProfile = await profilesCollection.findOne({
       memberName: studentName,
     });
 
-    if (!studentProfile) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Student profile not found." });
-    }
+    const newElapsedTime = Number(elapsedTime);
 
-    // --- Get existing time and add new time ---
-    const lessonData = studentProfile["Lesson Data"]?.find(
-      (ld) => ld.studentName === studentName
-    );
-    const existingElapsedTime =
-      lessonData?.lessonTimers?.[lessonId]?.elapsedTime || 0;
-    const newTotalElapsedTime = existingElapsedTime + Number(elapsedTime);
-    // --- End of new logic ---
-
-    // Format the time into M:SS
-    const minutes = Math.floor(newTotalElapsedTime / 60);
-    const seconds = Math.floor(newTotalElapsedTime % 60);
-    const formattedTime = `${minutes}:${seconds.toString().padStart(2, "0")}`;
-
-    // Update the database, assuming "Lesson Data" is an array and we're updating an element within it.
-    const updateResult = await profilesCollection.updateOne(
-      { memberName: studentName, "Lesson Data.studentName": studentName },
-      {
-        $set: {
-          "Lesson Data.$.lessonTimers.$[lessonId].elapsedTime":
-            newTotalElapsedTime,
-          "Lesson Data.$.lessonTimers.$[lessonId].elapsedMinutes":
-            formattedTime,
-          "Lesson Data.$.lessonTimers.$[lessonId].lastUpdated": new Date(),
-        },
-      },
-      {
-        arrayFilters: [{ lessonId: lessonId }],
-      }
-    );
-
-    if (updateResult.modifiedCount > 0) {
-      console.log(
-        `Updated lesson time for ${studentName}, lesson ${lessonId}. New total: ${formattedTime}`
+    if (studentProfile) {
+      const lessonData = studentProfile["Lesson Data"]?.find(
+        (ld) => ld.studentName === studentName,
       );
+      const existingElapsedTime =
+        lessonData?.lessonTimers?.[lessonId]?.elapsedTime || 0;
+      const newTotalElapsedTime = existingElapsedTime + newElapsedTime;
+
+      const minutes = Math.floor(newTotalElapsedTime / 60);
+      const seconds = Math.floor(newTotalElapsedTime % 60);
+      const formattedTime = `${minutes}:${seconds.toString().padStart(2, "0")}`;
+
+      const timerData = {
+        elapsedTime: newTotalElapsedTime,
+        elapsedMinutes: formattedTime,
+        lastUpdated: new Date(),
+      };
+
+      if (lessonData) {
+        // Update existing lesson data
+        await profilesCollection.updateOne(
+          { memberName: studentName, "Lesson Data.studentName": studentName },
+          { $set: { [`Lesson Data.$.lessonTimers.${lessonId}`]: timerData } },
+        );
+      } else {
+        // Push new lesson data object
+        await profilesCollection.updateOne(
+          { memberName: studentName },
+          {
+            $push: {
+              "Lesson Data": {
+                studentName,
+                lessonTimers: { [lessonId]: timerData },
+              },
+            },
+          },
+        );
+      }
+
       res.status(200).json({
         success: true,
         message: "Lesson time updated successfully.",
@@ -1656,39 +2152,32 @@ app.post("/update-lesson-time", async (req, res) => {
         formattedTime: formattedTime,
       });
     } else {
-      console.log(
-        "No document was updated. Attempting to create new timer entry."
-      );
+      // Create new student profile
+      const minutes = Math.floor(newElapsedTime / 60);
+      const seconds = Math.floor(newElapsedTime % 60);
+      const formattedTime = `${minutes}:${seconds.toString().padStart(2, "0")}`;
+      const timerData = {
+        elapsedTime: newElapsedTime,
+        elapsedMinutes: formattedTime,
+        lastUpdated: new Date(),
+      };
 
-      // If the update didn't work, try to create a new timer entry
-      const createResult = await profilesCollection.updateOne(
-        { memberName: studentName, "Lesson Data.studentName": studentName },
-        {
-          $set: {
-            "Lesson Data.$.lessonTimers": {
-              [lessonId]: {
-                elapsedTime: Number(elapsedTime),
-                elapsedMinutes: formattedTime,
-                lastUpdated: new Date(),
-              },
-            },
+      await profilesCollection.insertOne({
+        memberName: studentName,
+        "Lesson Data": [
+          {
+            studentName: studentName,
+            lessonTimers: { [lessonId]: timerData },
           },
-        }
-      );
+        ],
+      });
 
-      if (createResult.modifiedCount > 0) {
-        res.status(200).json({
-          success: true,
-          message: "New lesson timer created successfully.",
-          totalElapsedTime: Number(elapsedTime),
-          formattedTime: formattedTime,
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          message: "Failed to create or update lesson timer.",
-        });
-      }
+      res.status(201).json({
+        success: true,
+        message: "New student profile created and lesson time saved.",
+        totalElapsedTime: newElapsedTime,
+        formattedTime: formattedTime,
+      });
     }
   } catch (error) {
     console.error("Error updating lesson time:", error);
@@ -1720,7 +2209,7 @@ app.get("/api/timers", async (req, res) => {
     if (!studentProfile) {
       // If no profile, it's a new student for timer purposes.
       console.log(
-        `No profile found for student ${studentId}. Returning default timer.`
+        `No profile found for student ${studentId}. Returning default timer.`,
       );
       return res.status(200).json({
         success: true,
@@ -1732,14 +2221,14 @@ app.get("/api/timers", async (req, res) => {
 
     // Find lesson data for the student
     const lessonData = studentProfile["Lesson Data"]?.find(
-      (ld) => ld.studentName === studentId
+      (ld) => ld.studentName === studentId,
     );
 
     const timerData = lessonData?.lessonTimers?.[lessonId];
 
     if (!timerData) {
       console.log(
-        `No timer found for lesson ${lessonId} for student ${studentId}. Returning default timer.`
+        `No timer found for lesson ${lessonId} for student ${studentId}. Returning default timer.`,
       );
       return res.status(200).json({
         success: true,
@@ -1750,7 +2239,7 @@ app.get("/api/timers", async (req, res) => {
     }
 
     console.log(
-      `Retrieved lesson timer for ${studentId}, lesson ${lessonId}: ${timerData.elapsedTime} seconds`
+      `Retrieved lesson timer for ${studentId}, lesson ${lessonId}: ${timerData.elapsedTime} seconds`,
     );
 
     res.status(200).json({
@@ -1800,7 +2289,7 @@ app.get("/get-lesson-time/:studentName/:lessonId", async (req, res) => {
 
     // Get existing time for this lesson
     const lessonData = studentProfile["Lesson Data"]?.find(
-      (ld) => ld.studentName === studentName
+      (ld) => ld.studentName === studentName,
     );
 
     const existingElapsedTime =
@@ -1811,7 +2300,7 @@ app.get("/get-lesson-time/:studentName/:lessonId", async (req, res) => {
     const lastUpdated = lessonData?.lessonTimers?.[lessonId]?.lastUpdated;
 
     console.log(
-      `Retrieved lesson time for ${studentName}, lesson ${lessonId}: ${existingElapsedTime} seconds (${formattedTime})`
+      `Retrieved lesson time for ${studentName}, lesson ${lessonId}: ${existingElapsedTime} seconds (${formattedTime})`,
     );
 
     res.status(200).json({
@@ -1828,6 +2317,162 @@ app.get("/get-lesson-time/:studentName/:lessonId", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to retrieve lesson time.",
+    });
+  }
+});
+
+// GET endpoint to fetch saved condition states for a lesson
+app.get("/api/lesson-condition-state", async (req, res) => {
+  try {
+    const { studentId, lessonId } = req.query;
+
+    if (!studentId || !lessonId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required parameters: studentId, lessonId",
+      });
+    }
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    // Find the student's profile
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentId,
+    });
+
+    if (!studentProfile) {
+      return res.status(404).json({
+        success: false,
+        message: "Student profile not found.",
+      });
+    }
+
+    // Get lesson data for this student
+    const lessonData = studentProfile["Lesson Data"]?.find(
+      (ld) => ld.studentName === studentId,
+    );
+
+    // Get condition states for this specific lesson
+    const conditionStates = lessonData?.conditionStates?.[lessonId];
+
+    if (!conditionStates) {
+      return res.status(404).json({
+        success: false,
+        message: `No saved condition states found for lesson ${lessonId}.`,
+      });
+    }
+
+    console.log(
+      `Retrieved condition states for ${studentId}, lesson ${lessonId}:`,
+      conditionStates,
+    );
+
+    res.status(200).json({
+      success: true,
+      studentId: studentId,
+      lessonId: lessonId,
+      conditions: conditionStates,
+    });
+  } catch (error) {
+    console.error("Error fetching condition states:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch condition states.",
+    });
+  }
+});
+
+// POST endpoint to save condition states for a lesson
+app.post("/api/lesson-condition-state", async (req, res) => {
+  try {
+    const { studentId, lessonId, conditions } = req.body;
+
+    if (!studentId || !lessonId || !conditions) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required parameters: studentId, lessonId, conditions",
+      });
+    }
+
+    const profilesCollection = client
+      .db("TrinityCapital")
+      .collection("User Profiles");
+
+    const studentProfile = await profilesCollection.findOne({
+      memberName: studentId,
+    });
+
+    const conditionStatesData = {
+      [lessonId]: conditions,
+      savedAt: new Date(),
+    };
+
+    if (studentProfile) {
+      const lessonDataForStudent = studentProfile["Lesson Data"]?.find(
+        (d) => d.studentName === studentId,
+      );
+
+      if (lessonDataForStudent) {
+        // Update existing Lesson Data
+        await profilesCollection.updateOne(
+          { memberName: studentId, "Lesson Data.studentName": studentId },
+          {
+            $set: {
+              "Lesson Data.$.conditionStates": {
+                ...lessonDataForStudent.conditionStates,
+                ...conditionStatesData,
+              },
+              "Lesson Data.$.lastConditionUpdate": new Date(),
+            },
+          },
+        );
+      } else {
+        // Student exists, but no Lesson Data object for them, so push one.
+        await profilesCollection.updateOne(
+          { memberName: studentId },
+          {
+            $push: {
+              "Lesson Data": {
+                studentName: studentId,
+                conditionStates: conditionStatesData,
+                lastConditionUpdate: new Date(),
+              },
+            },
+          },
+        );
+      }
+    } else {
+      // Student does not exist, so create them with Lesson Data.
+      await profilesCollection.insertOne({
+        memberName: studentId,
+        "Lesson Data": [
+          {
+            studentName: studentId,
+            conditionStates: conditionStatesData,
+            lastConditionUpdate: new Date(),
+          },
+        ],
+      });
+    }
+
+    console.log(
+      `Condition states saved for ${studentId}, lesson ${lessonId}:`,
+      JSON.stringify(conditions, null, 2),
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Condition states saved successfully for lesson ${lessonId}`,
+      studentId: studentId,
+      lessonId: lessonId,
+    });
+  } catch (error) {
+    console.error("Error saving condition states:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to save condition states.",
     });
   }
 });
@@ -1877,7 +2522,7 @@ app.post("/api/sdsm/session", async (req, res) => {
     console.log("completedLessons is array?", Array.isArray(completedLessons));
     console.log(
       "completedLessons value:",
-      JSON.stringify(completedLessons, null, 2)
+      JSON.stringify(completedLessons, null, 2),
     );
 
     if (
@@ -1886,7 +2531,7 @@ app.post("/api/sdsm/session", async (req, res) => {
       completedLessons.length > 0
     ) {
       console.log(
-        `✅ Processing ${completedLessons.length} completed lessons for ${studentName}`
+        `✅ Processing ${completedLessons.length} completed lessons for ${studentName}`,
       );
 
       // Store completed lessons in the User Profiles document as an array
@@ -1900,13 +2545,13 @@ app.post("/api/sdsm/session", async (req, res) => {
 
       console.log(
         "📝 Attempting to save completion records:",
-        JSON.stringify(completionRecords, null, 2)
+        JSON.stringify(completionRecords, null, 2),
       );
 
       // ⚠️ SNAPSHOT VALIDATION - Check if snapshot contains data
       completionRecords.forEach((record, idx) => {
         console.log(
-          `\n🔍 SNAPSHOT ANALYSIS FOR LESSON ${idx + 1}: "${record.lessonTitle}"`
+          `\n🔍 SNAPSHOT ANALYSIS FOR LESSON ${idx + 1}: "${record.lessonTitle}"`,
         );
         console.log("================================================");
 
@@ -1925,11 +2570,11 @@ app.post("/api/sdsm/session", async (req, res) => {
           console.log(`   Type: ${typeof snapshot.bills}`);
           console.log(`   Is array: ${Array.isArray(snapshot.bills)}`);
           console.log(
-            `   Length: ${Array.isArray(snapshot.bills) ? snapshot.bills.length : "N/A"}`
+            `   Length: ${Array.isArray(snapshot.bills) ? snapshot.bills.length : "N/A"}`,
           );
           if (Array.isArray(snapshot.bills) && snapshot.bills.length > 0) {
             console.log(
-              `   Content: ${JSON.stringify(snapshot.bills, null, 2)}`
+              `   Content: ${JSON.stringify(snapshot.bills, null, 2)}`,
             );
           } else {
             console.log(`   ⚠️ WARNING: bills array is EMPTY`);
@@ -1943,14 +2588,14 @@ app.post("/api/sdsm/session", async (req, res) => {
           console.log(`   Type: ${typeof snapshot.paychecks}`);
           console.log(`   Is array: ${Array.isArray(snapshot.paychecks)}`);
           console.log(
-            `   Length: ${Array.isArray(snapshot.paychecks) ? snapshot.paychecks.length : "N/A"}`
+            `   Length: ${Array.isArray(snapshot.paychecks) ? snapshot.paychecks.length : "N/A"}`,
           );
           if (
             Array.isArray(snapshot.paychecks) &&
             snapshot.paychecks.length > 0
           ) {
             console.log(
-              `   Content: ${JSON.stringify(snapshot.paychecks, null, 2)}`
+              `   Content: ${JSON.stringify(snapshot.paychecks, null, 2)}`,
             );
           } else {
             console.log(`   ⚠️ WARNING: paychecks array is EMPTY`);
@@ -1968,13 +2613,13 @@ app.post("/api/sdsm/session", async (req, res) => {
             !Array.isArray(value)
           ) {
             console.log(
-              `  - ${key}: [object] with keys ${Object.keys(value).join(", ")}`
+              `  - ${key}: [object] with keys ${Object.keys(value).join(", ")}`,
             );
           } else if (Array.isArray(value)) {
             console.log(`  - ${key}: [array] length ${value.length}`);
           } else {
             console.log(
-              `  - ${key}: ${typeof value} = ${String(value).substring(0, 50)}`
+              `  - ${key}: ${typeof value} = ${String(value).substring(0, 50)}`,
             );
           }
         });
@@ -1987,73 +2632,106 @@ app.post("/api/sdsm/session", async (req, res) => {
       sessionData.completedLessons = completionRecords;
 
       console.log(
-        `✅ Prepared ${completionRecords.length} completion snapshots to be saved with session data`
+        `✅ Prepared ${completionRecords.length} completion snapshots to be saved with session data`,
       );
     }
 
-    // Update or create session data in user profile (includes completedLessons if present)
-    const updateData = {
-      $push: {
-        "Lesson Data": sessionData,
-      },
-      $set: {
-        lastSessionUpdate: sessionData.timestamp,
-      },
-    };
-
-    // Add completedLessons to root level if they exist
-    if (
-      completedLessons &&
-      Array.isArray(completedLessons) &&
-      completedLessons.length > 0
-    ) {
-      const completionRecords = completedLessons.map((completedLesson) => ({
-        lessonId: completedLesson.lessonId,
-        lessonTitle: completedLesson.lessonTitle,
-        completedAt: new Date(completedLesson.completedAt),
-        snapshot: completedLesson.snapshot,
-        sessionTimestamp: sessionData.timestamp,
-      }));
-
-      updateData.$push.completedLessons = { $each: completionRecords };
-    }
-
+    // --- New logic for lesson data consolidation ---
     try {
-      const updateResult = await profilesCollection.updateOne(
-        { memberName: studentName },
-        updateData,
-        { upsert: true }
+      const studentProfile = await profilesCollection.findOne({
+        memberName: studentName,
+      });
+
+      const updateOps = {
+        $set: { lastSessionUpdate: sessionData.timestamp },
+        $push: {},
+      };
+
+      // Handle root-level completedLessons
+      if (
+        sessionData.completedLessons &&
+        sessionData.completedLessons.length > 0
+      ) {
+        const rootExistingIds = new Set(
+          studentProfile?.completedLessons?.map((l) => l.lessonId) || [],
+        );
+        const newRootCompletionRecords = sessionData.completedLessons.filter(
+          (l) => !rootExistingIds.has(l.lessonId),
+        );
+        if (newRootCompletionRecords.length > 0) {
+          updateOps.$push.completedLessons = {
+            $each: newRootCompletionRecords,
+          };
+        }
+      }
+
+      const lessonDataForStudent = studentProfile?.["Lesson Data"]?.find(
+        (d) => d.studentName === studentName,
       );
 
-      console.log("✅ MongoDB updateOne result:", {
-        matchedCount: updateResult.matchedCount,
-        modifiedCount: updateResult.modifiedCount,
-        upsertedId: updateResult.upsertedId,
-        acknowledged: updateResult.acknowledged,
-      });
-    } catch (mongoError) {
-      console.error("❌ MongoDB Error saving completion records:", mongoError);
-      throw mongoError;
-    }
+      if (lessonDataForStudent) {
+        // --- UPDATE EXISTING LESSON DATA ---
+        updateOps.$set[`Lesson Data.$[elem].timestamp`] = sessionData.timestamp;
+        if (sessionData.activeLessons) {
+          updateOps.$set[`Lesson Data.$[elem].activeLessons`] =
+            sessionData.activeLessons;
+        }
+        if (sessionData.lessonTimers) {
+          for (const lessonId in sessionData.lessonTimers) {
+            updateOps.$set[`Lesson Data.$[elem].lessonTimers.${lessonId}`] =
+              sessionData.lessonTimers[lessonId];
+          }
+        }
 
-    const updateResult = {
-      acknowledged: true,
-    };
+        if (
+          sessionData.completedLessons &&
+          sessionData.completedLessons.length > 0
+        ) {
+          const nestedExistingIds = new Set(
+            lessonDataForStudent.completedLessons?.map((l) => l.lessonId) || [],
+          );
+          const newNestedCompletionRecords =
+            sessionData.completedLessons.filter(
+              (l) => !nestedExistingIds.has(l.lessonId),
+            );
+          if (newNestedCompletionRecords.length > 0) {
+            updateOps.$push[`Lesson Data.$[elem].completedLessons`] = {
+              $each: newNestedCompletionRecords,
+            };
+          }
+        }
 
-    if (updateResult.acknowledged) {
+        if (Object.keys(updateOps.$push).length === 0) delete updateOps.$push;
+
+        await profilesCollection.updateOne(
+          { memberName: studentName },
+          updateOps,
+          { arrayFilters: [{ "elem.studentName": studentName }] },
+        );
+      } else {
+        // --- PUSH NEW LESSON DATA ---
+        if (!updateOps.$push) updateOps.$push = {};
+        updateOps.$push["Lesson Data"] = sessionData;
+        await profilesCollection.updateOne(
+          { memberName: studentName },
+          updateOps,
+          { upsert: true },
+        );
+      }
+
       console.log(`Session data stored for ${studentName}`);
       res.status(200).json({
         success: true,
         message: "Session data stored successfully",
         completedLessonsStored: completedLessons ? completedLessons.length : 0,
       });
-    } else {
-      console.error("Failed to store session data");
-      res.status(500).json({
-        success: false,
-        message: "Failed to store session data",
-      });
+    } catch (error) {
+      console.error("Error processing SDSM session data:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to store session data." });
     }
+    // --- End of new logic ---
   } catch (error) {
     console.error("Error processing SDSM session data:", error);
     res
@@ -2088,7 +2766,7 @@ app.get("/student-lessons/:classPeriod", async (req, res) => {
     // Get master teacher's units and find which unit is assigned to this class period
     const masterTeacherDocument = await teachersCollection.findOne(
       { name: MASTER_TEACHER },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
     if (!masterTeacherDocument || !masterTeacherDocument.units) {
@@ -2102,7 +2780,7 @@ app.get("/student-lessons/:classPeriod", async (req, res) => {
 
     // Find the unit assigned to this class period
     const assignedUnit = masterTeacherDocument.units.find(
-      (unit) => unit.assigned_to_period === classPeriod
+      (unit) => unit.assigned_to_period === classPeriod,
     );
 
     if (!assignedUnit) {
@@ -2158,7 +2836,7 @@ app.get("/student-lessons/:classPeriod", async (req, res) => {
     });
 
     console.log(
-      `Found unit "${assignedUnit.name}" with ${fullLessons.length} lessons for period ${classPeriod}`
+      `Found unit "${assignedUnit.name}" with ${fullLessons.length} lessons for period ${classPeriod}`,
     );
 
     res.status(200).json({
@@ -2197,7 +2875,7 @@ app.get("/master-lessons", async (req, res) => {
     // Get master teacher's units
     const masterTeacherDocument = await teachersCollection.findOne(
       { name: MASTER_TEACHER },
-      { projection: { units: 1, _id: 0 } }
+      { projection: { units: 1, _id: 0 } },
     );
 
     // Get all master teacher's lessons
@@ -2218,7 +2896,7 @@ app.get("/master-lessons", async (req, res) => {
         : [];
 
     console.log(
-      `Returning ${masterUnits.length} units and ${masterLessons.length} lessons from master teacher`
+      `Returning ${masterUnits.length} units and ${masterLessons.length} lessons from master teacher`,
     );
 
     res.status(200).json({
@@ -2244,7 +2922,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Origin, X-Requested-With, Accept"
+    "Content-Type, Authorization, Origin, X-Requested-With, Accept",
   );
   res.header("Access-Control-Allow-Credentials", "true");
 
@@ -2256,13 +2934,13 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     // SUPER LOUD DEBUG - ALWAYS VISIBLE
     console.log("\n\n");
     console.log(
-      "*************************************************************"
+      "*************************************************************",
     );
     console.log(
-      "************ LESSON SERVER: GET-LESSONS-BY-IDS **************"
+      "************ LESSON SERVER: GET-LESSONS-BY-IDS **************",
     );
     console.log(
-      "*************************************************************"
+      "*************************************************************",
     );
     console.log("TIME:", new Date().toISOString());
     console.log("REQUEST RECEIVED FROM CLIENT");
@@ -2277,7 +2955,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
       console.log("LESSON IDS TYPE:", typeof lessonIds);
       console.log("LESSON IDS VALUE:", lessonIds);
       console.log(
-        "*************************************************************\n\n"
+        "*************************************************************\n\n",
       );
       return res.status(400).json({
         success: false,
@@ -2290,12 +2968,12 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     if (studentProfile) {
       console.log(
         "[get-lessons-by-ids] Student profile:",
-        JSON.stringify(studentProfile, null, 2)
+        JSON.stringify(studentProfile, null, 2),
       );
     }
     console.log(
       `[get-lessons-by-ids] Requesting ${lessonIds.length} lessons by ID:`,
-      lessonIds
+      lessonIds,
     );
 
     const { ObjectId } = require("mongodb");
@@ -2313,8 +2991,8 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           fields: Object.keys(l),
         })),
         null,
-        2
-      )
+        2,
+      ),
     );
 
     // ENHANCED ID PROCESSING: Handle multiple ID formats thoroughly
@@ -2339,11 +3017,11 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const objId = new ObjectId(id.toString());
           objectIds.push(objId);
           console.log(
-            `  ➕ Converted to ObjectId: ${objId} and added to objectIds array`
+            `  ➕ Converted to ObjectId: ${objId} and added to objectIds array`,
           );
         } catch (e) {
           console.log(
-            `  ❌ Could not convert numeric ID ${id} to ObjectId: ${e.message}`
+            `  ❌ Could not convert numeric ID ${id} to ObjectId: ${e.message}`,
           );
         }
       } else if (typeof id === "string") {
@@ -2356,11 +3034,11 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const numId = parseInt(id, 10);
           numericIds.push(numId);
           console.log(
-            `  ➕ Converted to number: ${numId} and added to numericIds array`
+            `  ➕ Converted to number: ${numId} and added to numericIds array`,
           );
         } else {
           console.log(
-            `  ℹ️ ID "${id}" doesn't look like a number, not converting`
+            `  ℹ️ ID "${id}" doesn't look like a number, not converting`,
           );
         }
 
@@ -2369,11 +3047,11 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const objId = new ObjectId(id);
           objectIds.push(objId);
           console.log(
-            `  ➕ Converted to ObjectId: ${objId} and added to objectIds array`
+            `  ➕ Converted to ObjectId: ${objId} and added to objectIds array`,
           );
         } catch (e) {
           console.log(
-            `  ❌ Could not convert string ID "${id}" to ObjectId: ${e.message}`
+            `  ❌ Could not convert string ID "${id}" to ObjectId: ${e.message}`,
           );
         }
       } else {
@@ -2384,11 +3062,11 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     console.log("\n📋 ID PROCESSING SUMMARY 📋");
     console.log("==========================");
     console.log(
-      `✅ Processed IDs: ${objectIds.length} ObjectIDs, ${stringIds.length} strings, ${numericIds.length} numbers`
+      `✅ Processed IDs: ${objectIds.length} ObjectIDs, ${stringIds.length} strings, ${numericIds.length} numbers`,
     );
     if (objectIds.length > 0) {
       console.log(
-        `📦 ObjectIDs: ${objectIds.map((id) => id.toString()).join(", ")}`
+        `📦 ObjectIDs: ${objectIds.map((id) => id.toString()).join(", ")}`,
       );
     }
     if (stringIds.length > 0) {
@@ -2407,7 +3085,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     if (objectIds.length > 0) {
       console.log("\n📌 QUERY #1: Using ObjectIds for _id field");
       console.log(
-        `Query: db.Lessons.find({ _id: { $in: [${objectIds.map((id) => id.toString()).join(", ")}] } })`
+        `Query: db.Lessons.find({ _id: { $in: [${objectIds.map((id) => id.toString()).join(", ")}] } })`,
       );
 
       try {
@@ -2429,7 +3107,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           console.log(`   - Has 'lesson' property: ${!!firstLesson.lesson}`);
           if (firstLesson.lesson) {
             console.log(
-              `   - Lesson title: ${firstLesson.lesson.lesson_title || "Not available"}`
+              `   - Lesson title: ${firstLesson.lesson.lesson_title || "Not available"}`,
             );
           }
         }
@@ -2442,7 +3120,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     if (stringIds.length > 0) {
       console.log("\n📌 QUERY #2: Using string IDs for lesson.lesson_id field");
       console.log(
-        `Query: db.Lessons.find({ "lesson.lesson_id": { $in: ["${stringIds.join('", "')}"] } })`
+        `Query: db.Lessons.find({ "lesson.lesson_id": { $in: ["${stringIds.join('", "')}"] } })`,
       );
 
       try {
@@ -2455,7 +3133,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...stringLessons1);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${stringLessons1.length} lessons by lesson.lesson_id field`
+          `✅ Found ${stringLessons1.length} lessons by lesson.lesson_id field`,
         );
 
         if (stringLessons1.length > 0) {
@@ -2463,7 +3141,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const firstLesson = stringLessons1[0];
           console.log(`   - _id: ${firstLesson._id}`);
           console.log(
-            `   - lesson.lesson_id: ${firstLesson.lesson?.lesson_id || "Not available"}`
+            `   - lesson.lesson_id: ${firstLesson.lesson?.lesson_id || "Not available"}`,
           );
         }
       } catch (error) {
@@ -2472,7 +3150,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
 
       console.log("\n📌 QUERY #3: Using string IDs for lessonId field");
       console.log(
-        `Query: db.Lessons.find({ "lessonId": { $in: ["${stringIds.join('", "')}"] } })`
+        `Query: db.Lessons.find({ "lessonId": { $in: ["${stringIds.join('", "')}"] } })`,
       );
 
       try {
@@ -2485,7 +3163,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...stringLessons2);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${stringLessons2.length} lessons by lessonId field`
+          `✅ Found ${stringLessons2.length} lessons by lessonId field`,
         );
 
         if (stringLessons2.length > 0) {
@@ -2493,7 +3171,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const firstLesson = stringLessons2[0];
           console.log(`   - _id: ${firstLesson._id}`);
           console.log(
-            `   - lessonId: ${firstLesson.lessonId || "Not available"}`
+            `   - lessonId: ${firstLesson.lessonId || "Not available"}`,
           );
         }
       } catch (error) {
@@ -2502,7 +3180,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
 
       console.log("\n📌 QUERY #4: Using string IDs for lesson_id field");
       console.log(
-        `Query: db.Lessons.find({ "lesson_id": { $in: ["${stringIds.join('", "')}"] } })`
+        `Query: db.Lessons.find({ "lesson_id": { $in: ["${stringIds.join('", "')}"] } })`,
       );
 
       try {
@@ -2515,7 +3193,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...stringLessons3);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${stringLessons3.length} lessons by lesson_id field`
+          `✅ Found ${stringLessons3.length} lessons by lesson_id field`,
         );
 
         if (stringLessons3.length > 0) {
@@ -2523,7 +3201,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const firstLesson = stringLessons3[0];
           console.log(`   - _id: ${firstLesson._id}`);
           console.log(
-            `   - lesson_id: ${firstLesson.lesson_id || "Not available"}`
+            `   - lesson_id: ${firstLesson.lesson_id || "Not available"}`,
           );
         }
       } catch (error) {
@@ -2534,10 +3212,10 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     // Try to find lessons using numeric IDs for various ID fields
     if (numericIds.length > 0) {
       console.log(
-        "\n📌 QUERY #5: Using numeric IDs for lesson.lesson_id field"
+        "\n📌 QUERY #5: Using numeric IDs for lesson.lesson_id field",
       );
       console.log(
-        `Query: db.Lessons.find({ "lesson.lesson_id": { $in: [${numericIds.join(", ")}] } })`
+        `Query: db.Lessons.find({ "lesson.lesson_id": { $in: [${numericIds.join(", ")}] } })`,
       );
 
       try {
@@ -2550,7 +3228,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...numericLessons1);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${numericLessons1.length} lessons by lesson.lesson_id field as number`
+          `✅ Found ${numericLessons1.length} lessons by lesson.lesson_id field as number`,
         );
 
         if (numericLessons1.length > 0) {
@@ -2558,18 +3236,18 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const firstLesson = numericLessons1[0];
           console.log(`   - _id: ${firstLesson._id}`);
           console.log(
-            `   - lesson.lesson_id: ${firstLesson.lesson?.lesson_id || "Not available"}`
+            `   - lesson.lesson_id: ${firstLesson.lesson?.lesson_id || "Not available"}`,
           );
         }
       } catch (error) {
         console.error(
-          `❌ Error in numeric lesson.lesson_id query: ${error.message}`
+          `❌ Error in numeric lesson.lesson_id query: ${error.message}`,
         );
       }
 
       console.log("\n📌 QUERY #6: Using numeric IDs for lessonId field");
       console.log(
-        `Query: db.Lessons.find({ "lessonId": { $in: [${numericIds.join(", ")}] } })`
+        `Query: db.Lessons.find({ "lessonId": { $in: [${numericIds.join(", ")}] } })`,
       );
 
       try {
@@ -2582,7 +3260,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...numericLessons2);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${numericLessons2.length} lessons by lessonId field as number`
+          `✅ Found ${numericLessons2.length} lessons by lessonId field as number`,
         );
 
         if (numericLessons2.length > 0) {
@@ -2590,7 +3268,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const firstLesson = numericLessons2[0];
           console.log(`   - _id: ${firstLesson._id}`);
           console.log(
-            `   - lessonId: ${firstLesson.lessonId || "Not available"}`
+            `   - lessonId: ${firstLesson.lessonId || "Not available"}`,
           );
         }
       } catch (error) {
@@ -2599,7 +3277,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
 
       console.log("\n📌 QUERY #7: Using numeric IDs for lesson_id field");
       console.log(
-        `Query: db.Lessons.find({ "lesson_id": { $in: [${numericIds.join(", ")}] } })`
+        `Query: db.Lessons.find({ "lesson_id": { $in: [${numericIds.join(", ")}] } })`,
       );
 
       try {
@@ -2612,7 +3290,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...numericLessons3);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${numericLessons3.length} lessons by lesson_id field as number`
+          `✅ Found ${numericLessons3.length} lessons by lesson_id field as number`,
         );
 
         if (numericLessons3.length > 0) {
@@ -2620,7 +3298,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           const firstLesson = numericLessons3[0];
           console.log(`   - _id: ${firstLesson._id}`);
           console.log(
-            `   - lesson_id: ${firstLesson.lesson_id || "Not available"}`
+            `   - lesson_id: ${firstLesson.lesson_id || "Not available"}`,
           );
         }
       } catch (error) {
@@ -2630,7 +3308,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
       // Additional query: Try _id field directly with numbers
       console.log("\n📌 QUERY #8: Using numeric IDs for _id field directly");
       console.log(
-        `Query: db.Lessons.find({ "_id": { $in: [${numericIds.join(", ")}] } })`
+        `Query: db.Lessons.find({ "_id": { $in: [${numericIds.join(", ")}] } })`,
       );
 
       try {
@@ -2643,7 +3321,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
         lessonDocuments.push(...numericLessons4);
         console.log(`✅ Query completed in ${queryTime}ms`);
         console.log(
-          `✅ Found ${numericLessons4.length} lessons by _id field as number`
+          `✅ Found ${numericLessons4.length} lessons by _id field as number`,
         );
 
         if (numericLessons4.length > 0) {
@@ -2661,7 +3339,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     console.log("\n🧹 DEDUPLICATION PROCESS 🧹");
     console.log("==========================");
     console.log(
-      `Total lessons found before deduplication: ${lessonDocuments.length}`
+      `Total lessons found before deduplication: ${lessonDocuments.length}`,
     );
 
     if (lessonDocuments.length > 0) {
@@ -2673,19 +3351,19 @@ app.post("/get-lessons-by-ids", async (req, res) => {
 
     const uniqueLessons = lessonDocuments.filter((lesson, index, self) => {
       const firstIndex = self.findIndex(
-        (l) => l._id.toString() === lesson._id.toString()
+        (l) => l._id.toString() === lesson._id.toString(),
       );
       const isDuplicate = index !== firstIndex;
       if (isDuplicate) {
         console.log(
-          `  ↪️ Duplicate found: ${lesson._id} (index ${index} is duplicate of index ${firstIndex})`
+          `  ↪️ Duplicate found: ${lesson._id} (index ${index} is duplicate of index ${firstIndex})`,
         );
       }
       return !isDuplicate;
     });
 
     console.log(
-      `✅ After deduplication: ${uniqueLessons.length} unique lessons (removed ${lessonDocuments.length - uniqueLessons.length} duplicates)`
+      `✅ After deduplication: ${uniqueLessons.length} unique lessons (removed ${lessonDocuments.length - uniqueLessons.length} duplicates)`,
     );
 
     // Transform lessons to the format expected by the lesson engine
@@ -2695,17 +3373,17 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     const lessons = uniqueLessons.map((doc, index) => {
       // Log the document structure to help with debugging
       console.log(
-        `\n📝 Processing lesson ${index + 1}/${uniqueLessons.length} with ID ${doc._id}:`
+        `\n📝 Processing lesson ${index + 1}/${uniqueLessons.length} with ID ${doc._id}:`,
       );
       console.log(`  - Document fields: ${Object.keys(doc).join(", ")}`);
 
       if (doc.lesson) {
         console.log(
-          `  - Has 'lesson' property with fields: ${Object.keys(doc.lesson).join(", ")}`
+          `  - Has 'lesson' property with fields: ${Object.keys(doc.lesson).join(", ")}`,
         );
       } else {
         console.log(
-          `  - No 'lesson' property found, using top-level properties`
+          `  - No 'lesson' property found, using top-level properties`,
         );
       }
 
@@ -2720,7 +3398,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
           return doc.lesson[propName];
         }
         console.log(
-          `  - '${propName}' not found, using default: ${defaultValue}`
+          `  - '${propName}' not found, using default: ${defaultValue}`,
         );
         return defaultValue;
       };
@@ -2741,7 +3419,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
       };
 
       console.log(
-        `  ✅ Transformed lesson: ID=${transformedLesson._id}, Title=${transformedLesson.lesson_title || "(no title)"}`
+        `  ✅ Transformed lesson: ID=${transformedLesson._id}, Title=${transformedLesson.lesson_title || "(no title)"}`,
       );
       return transformedLesson;
     });
@@ -2769,7 +3447,7 @@ app.post("/get-lessons-by-ids", async (req, res) => {
 
       if (lessonBlocks.length > 0) {
         console.log(
-          `  - First block type: ${lessonBlocks[0].type || "unknown"}`
+          `  - First block type: ${lessonBlocks[0].type || "unknown"}`,
         );
       }
     });
@@ -2783,20 +3461,834 @@ app.post("/get-lessons-by-ids", async (req, res) => {
     });
 
     console.log(
-      "RESPONSE SENT TO CLIENT: success=true, foundCount=" + lessons.length
+      "RESPONSE SENT TO CLIENT: success=true, foundCount=" + lessons.length,
     );
     console.log(
-      "*************************************************************\n\n"
+      "*************************************************************\n\n",
     );
   } catch (error) {
     console.error("Failed to fetch lessons by IDs:", error);
     console.log("ERROR:", error.message);
     console.log(
-      "*************************************************************\n\n"
+      "*************************************************************\n\n",
     );
     res.status(500).json({
       success: false,
       message: "Failed to fetch lessons: " + error.message,
+    });
+  }
+});
+
+// Fix endpoint to repair corrupted lesson structure
+// Converts nested lesson object to flat structure at top level
+app.post("/fix-lesson-structure/:lessonId", async (req, res) => {
+  try {
+    const { lessonId } = req.params;
+
+    if (!lessonId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing lessonId parameter",
+      });
+    }
+
+    console.log(`\n========== FIXING LESSON STRUCTURE ==========`);
+    console.log(`Lesson ID: ${lessonId}`);
+
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Try to find the lesson by numeric ID
+    const numericId = parseInt(lessonId, 10);
+    let lesson = null;
+
+    if (!isNaN(numericId)) {
+      lesson = await lessonsCollection.findOne({ _id: numericId });
+    }
+
+    if (!lesson) {
+      return res.status(404).json({
+        success: false,
+        message: `Lesson ${lessonId} not found`,
+      });
+    }
+
+    console.log("Found lesson with structure:", Object.keys(lesson));
+
+    // Check if lesson has nested structure (data inside lesson.lesson object)
+    if (lesson.lesson && typeof lesson.lesson === "object") {
+      console.log(
+        "✅ Detected nested lesson structure - converting to flat structure",
+      );
+
+      // Extract all data from nested lesson object
+      const nestedData = lesson.lesson;
+
+      // Build the flattened lesson document with all data at top level
+      const flattenedLesson = {
+        _id: lesson._id,
+        lesson_title: nestedData.lesson_title || lesson.lesson_title || "",
+        lesson_description:
+          nestedData.lesson_description || lesson.lesson_description || "",
+        content: nestedData.content || lesson.content || [],
+        lesson_blocks: nestedData.lesson_blocks || lesson.lesson_blocks || [],
+        intro_text_blocks:
+          nestedData.intro_text_blocks || lesson.intro_text_blocks || [],
+        learning_objectives:
+          nestedData.learning_objectives || lesson.learning_objectives || [],
+        lesson_conditions:
+          nestedData.lesson_conditions || lesson.lesson_conditions || [],
+        required_actions:
+          nestedData.required_actions || lesson.required_actions || [],
+        success_metrics:
+          nestedData.success_metrics || lesson.success_metrics || {},
+        teks_standards:
+          nestedData.teks_standards || lesson.teks_standards || [],
+        day: nestedData.day || lesson.day || null,
+        status: nestedData.status || lesson.status || "active",
+        difficulty_level:
+          nestedData.difficulty_level || lesson.difficulty_level || null,
+        estimated_duration:
+          nestedData.estimated_duration || lesson.estimated_duration || null,
+        dallas_fed_aligned:
+          nestedData.dallas_fed_aligned !== undefined
+            ? nestedData.dallas_fed_aligned
+            : lesson.dallas_fed_aligned || null,
+        condition_alignment:
+          nestedData.condition_alignment || lesson.condition_alignment || null,
+        structure_cleaned:
+          nestedData.structure_cleaned || lesson.structure_cleaned || null,
+        teacher: nestedData.teacher || lesson.teacher,
+        unit: nestedData.unit || lesson.unit,
+        creator_email: nestedData.creator_email || lesson.creator_email,
+        creator_username:
+          nestedData.creator_username || lesson.creator_username,
+        createdAt: nestedData.createdAt || lesson.createdAt,
+        updatedAt: nestedData.updatedAt || lesson.updatedAt || new Date(),
+      };
+
+      // Clean lesson_conditions array - remove any metadata that ended up inside it
+      flattenedLesson.lesson_conditions = flattenedLesson.lesson_conditions.map(
+        (condition) => {
+          // Extract only condition-related fields, remove metadata
+          return {
+            condition_type: condition.condition_type,
+            condition_value: condition.condition_value,
+            value: condition.value,
+            action_type: condition.action_type,
+            action_details: condition.action_details,
+            action: condition.action,
+          };
+        },
+      );
+
+      console.log("\n📝 Flattened lesson structure:");
+      console.log(`  - lesson_title: ${flattenedLesson.lesson_title}`);
+      console.log(
+        `  - lesson_description: ${flattenedLesson.lesson_description}`,
+      );
+      console.log(`  - content items: ${flattenedLesson.content.length}`);
+      console.log(`  - lesson_blocks: ${flattenedLesson.lesson_blocks.length}`);
+      console.log(
+        `  - lesson_conditions: ${flattenedLesson.lesson_conditions.length}`,
+      );
+      console.log(
+        `  - learning_objectives: ${flattenedLesson.learning_objectives.length}`,
+      );
+      console.log(
+        `  - required_actions: ${flattenedLesson.required_actions.length}`,
+      );
+      console.log(`  - teacher: ${flattenedLesson.teacher}`);
+      console.log(`  - status: ${flattenedLesson.status}`);
+
+      // Update the lesson in the database with flattened structure
+      const updateResult = await lessonsCollection.updateOne(
+        { _id: lesson._id },
+        { $set: flattenedLesson },
+      );
+
+      if (updateResult.modifiedCount === 0) {
+        console.warn("⚠️ No documents were modified");
+      }
+
+      console.log(
+        `✅ FIXED: Lesson structure corrected and saved to database\n`,
+      );
+
+      res.status(200).json({
+        success: true,
+        message: `Lesson ${lessonId} structure fixed successfully`,
+        details: {
+          lessonId: lesson._id,
+          lessonTitle: flattenedLesson.lesson_title,
+          contentItems: flattenedLesson.content.length,
+          lessonBlocks: flattenedLesson.lesson_blocks.length,
+          conditions: flattenedLesson.lesson_conditions.length,
+          learningObjectives: flattenedLesson.learning_objectives.length,
+        },
+      });
+    } else {
+      // Lesson already has correct flat structure
+      console.log(
+        "✅ Lesson already has correct flat structure - no fix needed",
+      );
+
+      res.status(200).json({
+        success: true,
+        message: `Lesson ${lessonId} already has correct structure`,
+        isAlreadyFlat: true,
+      });
+    }
+  } catch (error) {
+    console.error("Failed to fix lesson structure:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fix lesson structure: " + error.message,
+    });
+  }
+});
+
+// Fix lesson conditions: populate condition_value from value field
+app.post("/fix-lesson-conditions/:lessonId", async (req, res) => {
+  try {
+    const { lessonId } = req.params;
+
+    console.log(`\n--- Fix Lesson Conditions: ${lessonId} ---`);
+
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Parse lessonId (could be numeric or ObjectId)
+    let numericId = parseInt(lessonId, 10);
+    let query = {};
+
+    if (!isNaN(numericId)) {
+      query = { _id: numericId };
+    } else {
+      const { ObjectId } = require("mongodb");
+      try {
+        query = { _id: new ObjectId(lessonId) };
+      } catch (e) {
+        query = { _id: lessonId };
+      }
+    }
+
+    console.log(`Query: ${JSON.stringify(query)}`);
+
+    // Fetch the lesson
+    const lesson = await lessonsCollection.findOne(query);
+
+    if (!lesson) {
+      return res.status(404).json({
+        success: false,
+        message: `Lesson not found: ${lessonId}`,
+      });
+    }
+
+    console.log(
+      `Found lesson: ${lesson.lesson_title || lesson.lesson?.lesson_title || "Unknown"}`,
+    );
+
+    // Check if conditions need fixing
+    const conditions = lesson.lesson_conditions || [];
+
+    if (conditions.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "Lesson has no conditions",
+        conditionsCounted: 0,
+        conditionsFixed: 0,
+      });
+    }
+
+    console.log(`📋 Processing ${conditions.length} conditions...`);
+
+    let conditionsFixed = 0;
+
+    // Fix each condition by copying value to condition_value if condition_value is null
+    const fixedConditions = conditions.map((condition, index) => {
+      console.log(`\n  Condition ${index + 1}: ${condition.condition_type}`);
+      console.log(`    - condition_value: ${condition.condition_value}`);
+      console.log(`    - value: ${condition.value}`);
+
+      if (condition.condition_value === null && condition.value !== undefined) {
+        console.log(
+          `    ✅ FIXING: Setting condition_value to ${condition.value}`,
+        );
+        conditionsFixed++;
+        return {
+          ...condition,
+          condition_value: condition.value,
+        };
+      } else if (condition.condition_value !== null) {
+        console.log(
+          `    ℹ️  SKIP: condition_value already set to ${condition.condition_value}`,
+        );
+      } else {
+        console.log(`    ⚠️  WARN: No value to fix`);
+      }
+
+      return condition;
+    });
+
+    if (conditionsFixed === 0) {
+      console.log("\n✅ No conditions needed fixing");
+      return res.status(200).json({
+        success: true,
+        message: "All conditions already have condition_value populated",
+        conditionsCounted: conditions.length,
+        conditionsFixed: 0,
+      });
+    }
+
+    // Update the lesson with fixed conditions
+    console.log(
+      `\n💾 Saving ${conditionsFixed} fixed conditions to database...`,
+    );
+
+    const updateResult = await lessonsCollection.updateOne(query, {
+      $set: { lesson_conditions: fixedConditions },
+    });
+
+    if (updateResult.matchedCount === 0) {
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update lesson",
+      });
+    }
+
+    console.log(`✅ FIXED: ${conditionsFixed} conditions updated and saved`);
+
+    res.status(200).json({
+      success: true,
+      message: `Fixed ${conditionsFixed} condition values for lesson`,
+      lessonId: lesson._id,
+      lessonTitle: lesson.lesson_title || lesson.lesson?.lesson_title,
+      conditionsCounted: conditions.length,
+      conditionsFixed: conditionsFixed,
+    });
+  } catch (error) {
+    console.error("Failed to fix lesson conditions:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fix lesson conditions: " + error.message,
+    });
+  }
+});
+
+// Restore lesson to clean proper structure (remove duplicates and unnecessary fields)
+app.post("/restore-lesson/:lessonId", async (req, res) => {
+  try {
+    const { lessonId } = req.params;
+
+    console.log(`\n--- Restore Lesson Structure: ${lessonId} ---`);
+
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Parse lessonId (could be numeric or ObjectId)
+    let numericId = parseInt(lessonId, 10);
+    let query = {};
+
+    if (!isNaN(numericId)) {
+      query = { _id: numericId };
+    } else {
+      const { ObjectId } = require("mongodb");
+      try {
+        query = { _id: new ObjectId(lessonId) };
+      } catch (e) {
+        query = { _id: lessonId };
+      }
+    }
+
+    // Fetch the lesson
+    const lesson = await lessonsCollection.findOne(query);
+
+    if (!lesson) {
+      return res.status(404).json({
+        success: false,
+        message: `Lesson not found: ${lessonId}`,
+      });
+    }
+
+    const lessonData = lesson.lesson || lesson;
+    const lessonTitle = lessonData.lesson_title || "Unknown";
+
+    console.log(`Found lesson: ${lessonTitle}`);
+
+    // Build clean lesson object with only necessary fields
+    const cleanLesson = {
+      _id: lesson._id,
+      lesson: {
+        lesson_title: lessonData.lesson_title || "",
+        lesson_description: lessonData.lesson_description || "",
+        unit: lessonData.unit || "",
+        content: lessonData.content || [],
+        learning_objectives: lessonData.learning_objectives || [],
+        creator_email: lessonData.creator_email || "admin@trinity-capital.net",
+        creator_username: lessonData.creator_username || "adminTC",
+        teacher: lessonData.teacher || "admin@trinity-capital.net",
+        createdAt: lessonData.createdAt || new Date(),
+        dallas_fed_aligned:
+          typeof lessonData.dallas_fed_aligned === "boolean"
+            ? lessonData.dallas_fed_aligned
+            : true,
+        teks_standards: lessonData.teks_standards || [],
+        day: lessonData.day || null,
+        status: lessonData.status || "active",
+        difficulty_level: lessonData.difficulty_level || null,
+        estimated_duration: lessonData.estimated_duration || null,
+        condition_alignment:
+          lessonData.condition_alignment || "teacher_dashboard_compatible",
+        structure_cleaned: true,
+        updatedAt: new Date(),
+      },
+      teacher: lessonData.teacher || "admin@trinity-capital.net",
+      unit: lessonData.unit || "",
+      createdAt: lessonData.createdAt || new Date(),
+    };
+
+    // Clean lesson_conditions - remove duplicates, remove null action_type/action_details, keep only essential fields
+    const conditions = lessonData.lesson_conditions || [];
+    const cleanedConditions = [];
+    const seenConditions = new Set();
+
+    for (const cond of conditions) {
+      if (!cond.condition_type) continue;
+
+      // Create a unique key to detect duplicates
+      const condKey = `${cond.condition_type}_${cond.condition_value || cond.value}`;
+      if (seenConditions.has(condKey)) {
+        console.log(`  ⏭️ Skipping duplicate condition: ${condKey}`);
+        continue;
+      }
+      seenConditions.add(condKey);
+
+      // Clean condition object - keep only essential fields
+      const cleanCond = {
+        condition_type: cond.condition_type,
+        condition_value:
+          cond.condition_value !== null ? cond.condition_value : cond.value,
+        action_type: cond.action_type || null,
+      };
+
+      // Add action_details only if action_type is set and details exist
+      if (cond.action_type && cond.action_details) {
+        cleanCond.action_details = cond.action_details;
+      }
+
+      // Add action if it has meaningful properties
+      if (cond.action && Object.keys(cond.action).length > 0) {
+        cleanCond.action = cond.action;
+      }
+
+      cleanedConditions.push(cleanCond);
+      console.log(
+        `  ✅ Cleaned condition: ${cond.condition_type} = ${cleanCond.condition_value}`,
+      );
+    }
+
+    cleanLesson.lesson.lesson_conditions = cleanedConditions;
+
+    // Add required_actions if not present
+    if (!lesson.required_actions || lesson.required_actions.length === 0) {
+      cleanLesson.lesson.required_actions = cleanedConditions.map(
+        (c) => c.condition_type,
+      );
+      console.log(`  ✅ Generated required_actions from conditions`);
+    } else {
+      cleanLesson.lesson.required_actions = lesson.required_actions;
+    }
+
+    // Add success_metrics with defaults
+    cleanLesson.lesson.success_metrics = {
+      minimum_conditions_met: Math.max(
+        Math.floor(cleanedConditions.length * 0.66),
+        2,
+      ),
+      time_limit_minutes: 30,
+      engagement_score_minimum: 60,
+      updated_at: new Date(),
+    };
+
+    console.log(`\n✅ Cleaned lesson structure:`);
+    console.log(
+      `   - Conditions: ${cleanedConditions.length} (removed duplicates)`,
+    );
+    console.log(
+      `   - Required actions: ${cleanLesson.lesson.required_actions.length}`,
+    );
+    console.log(`   - Content items: ${cleanLesson.lesson.content.length}`);
+
+    // Replace the entire lesson document
+    const updateResult = await lessonsCollection.replaceOne(query, cleanLesson);
+
+    if (updateResult.matchedCount === 0) {
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update lesson",
+      });
+    }
+
+    console.log(`✅ RESTORED: Lesson structure cleaned and saved`);
+
+    res.status(200).json({
+      success: true,
+      message: `Lesson ${lessonTitle} restored to clean structure`,
+      lessonId: lesson._id,
+      lessonTitle: lessonTitle,
+      conditionsCleaned: cleanedConditions.length,
+      duplicatesRemoved: conditions.length - cleanedConditions.length,
+    });
+  } catch (error) {
+    console.error("Failed to restore lesson:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to restore lesson: " + error.message,
+    });
+  }
+});
+
+// Add TEKS-aligned content blocks to a lesson
+app.post("/add-teks-blocks/:lessonId", async (req, res) => {
+  try {
+    const { lessonId } = req.params;
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Parse lesson ID
+    let query = {};
+    const numericId = parseInt(lessonId, 10);
+
+    if (!isNaN(numericId)) {
+      query = { _id: numericId };
+    } else {
+      query = { _id: lessonId };
+    }
+
+    // Fetch existing lesson
+    const existingLesson = await lessonsCollection.findOne(query);
+
+    if (!existingLesson) {
+      return res.status(404).json({
+        success: false,
+        message: "Lesson not found",
+      });
+    }
+
+    const existingLessonData = existingLesson.lesson || {};
+
+    // TEKS-aligned intro blocks
+    const introBlocks = [
+      {
+        type: "header",
+        content: "Understanding Your Money Personality",
+        level: "h1",
+      },
+      {
+        type: "text",
+        content:
+          "Your money personality reflects how you earn, spend, save, and invest your money. Understanding your financial personality helps you make better financial decisions aligned with your values and goals. This lesson aligns with TEKS §113.76(b)(1) - Students will understand personal financial goals and the purposes and uses of money.",
+      },
+      {
+        type: "header",
+        content: "What is a Money Personality?",
+        level: "h2",
+      },
+      {
+        type: "text",
+        content:
+          "A money personality is your natural tendency toward managing finances. Some people are savers, others are spenders. Some are risk-takers, others are cautious. Knowing your personality type helps you understand your financial behaviors and make intentional choices about earning, spending, and saving.",
+      },
+    ];
+
+    // TEKS-aligned lesson blocks
+    const lessonBlocks = [
+      {
+        type: "section",
+        header: "TEKS §113.76(b)(2): Earning and Income",
+        blocks: [
+          {
+            type: "header",
+            content: "Understanding Earning and Income",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Your income is the money you earn through work, investments, or other sources. The amount you earn affects your ability to spend, save, and invest. Different money personalities approach earning differently—some seek high-income careers, while others prioritize job satisfaction and work-life balance.",
+          },
+          {
+            type: "list",
+            items: [
+              "Earned income (wages, salary, tips from employment)",
+              "Passive income (interest, dividends, rental income)",
+              "Gift income (allowance, inheritance, gifts)",
+              "Government benefits (scholarships, grants, subsidies)",
+            ],
+          },
+        ],
+      },
+      {
+        type: "section",
+        header: "TEKS §113.76(b)(3): Spending and Budgeting",
+        blocks: [
+          {
+            type: "header",
+            content: "Spending Decisions and Budget Planning",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Spending is how you use your money to pay for goods and services. A budget is a plan for your money that shows how much you'll earn and how you'll spend it. Your money personality influences your spending habits—whether you're impulsive, deliberate, minimalist, or generous.",
+          },
+          {
+            type: "list",
+            items: [
+              "Fixed expenses (rent, insurance, utilities that stay the same each month)",
+              "Variable expenses (groceries, entertainment, transportation that changes)",
+              "Essential expenses (food, shelter, healthcare needed to survive)",
+              "Discretionary expenses (entertainment, dining out, hobbies you choose)",
+            ],
+          },
+        ],
+      },
+      {
+        type: "section",
+        header: "TEKS §113.76(b)(4): Saving and Goal-Setting",
+        blocks: [
+          {
+            type: "header",
+            content: "Saving Strategies and Financial Goals",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Saving is setting aside money for future use. Financial goals guide your saving decisions. Different money personalities have different motivations for saving—security, freedom, opportunity, or generosity. Setting clear goals helps you stay motivated to save.",
+          },
+          {
+            type: "list",
+            items: [
+              "Emergency savings (3-6 months of expenses for unexpected events)",
+              "Short-term savings goals (less than 1 year: vacation, new phone)",
+              "Medium-term savings goals (1-5 years: car, college)",
+              "Long-term savings goals (5+ years: house, retirement, education)",
+            ],
+          },
+        ],
+      },
+      {
+        type: "section",
+        header: "TEKS §113.76(b)(5): Investing and Building Wealth",
+        blocks: [
+          {
+            type: "header",
+            content: "Investing for Long-Term Wealth",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Investing is using money to purchase assets that may grow in value or generate income. Risk tolerance varies by money personality—some personalities naturally prefer safer investments, while others are comfortable with higher-risk opportunities for greater returns.",
+          },
+          {
+            type: "list",
+            items: [
+              "Stocks (ownership shares in companies)",
+              "Bonds (loans you make to governments or companies)",
+              "Mutual funds (professionally managed investment collections)",
+              "Real estate (property ownership for appreciation or rental income)",
+              "Retirement accounts (401k, IRA, 403b for future security)",
+            ],
+          },
+        ],
+      },
+      {
+        type: "section",
+        header: "TEKS §113.76(b)(6): Credit and Debt Management",
+        blocks: [
+          {
+            type: "header",
+            content: "Understanding Credit and Managing Debt",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Credit is borrowing money with the promise to repay it. Debt is money you owe. Your money personality affects how you use credit—some personalities avoid debt entirely, while others use it strategically. Understanding credit helps you borrow wisely and build financial stability.",
+          },
+          {
+            type: "list",
+            items: [
+              "Credit score (3-digit number reflecting your credit history, 300-850 range)",
+              "Credit cards (borrowing tools that require monthly repayment)",
+              "Student loans (borrowing for education)",
+              "Auto loans (borrowing to purchase vehicles)",
+              "Mortgages (long-term borrowing to purchase homes)",
+              "Interest rates (cost of borrowing—affects total amount you repay)",
+            ],
+          },
+        ],
+      },
+      {
+        type: "section",
+        header: "Money Personalities and Financial Decision-Making",
+        blocks: [
+          {
+            type: "header",
+            content: "Recognizing Your Money Personality",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Common money personalities include: The Saver (values security and consistency), The Spender (enjoys experiences and generosity), The Investor (seeks growth and opportunity), The Debtor (comfortable with borrowing), and The Avoider (uncomfortable with financial decisions). Understanding your personality helps you make intentional financial choices.",
+          },
+          {
+            type: "header",
+            content: "Aligning Personality with Goals",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "Your money personality isn't fixed—you can develop new financial habits. If you're naturally a spender but want to save more, you can set automatic transfers. If you avoid financial decisions, you can create simple systems. The key is understanding yourself and making intentional choices.",
+          },
+        ],
+      },
+      {
+        type: "section",
+        header: "TEKS §113.76(c): Making Wise Financial Decisions",
+        blocks: [
+          {
+            type: "header",
+            content: "Decision-Making Framework",
+            level: "h3",
+          },
+          {
+            type: "text",
+            content:
+              "When making financial decisions, consider: What is my goal? What are my options? What are the pros and cons of each option? What are the short-term and long-term consequences? Does this align with my values? This framework helps you make decisions that support your money personality while working toward your goals.",
+          },
+        ],
+      },
+    ];
+
+    // Merge with existing data - preserve everything, add/update blocks
+    const updatedLesson = {
+      _id: numericId || lessonId,
+      lesson: {
+        ...existingLessonData,
+        intro_text_blocks: introBlocks,
+        lesson_blocks: lessonBlocks,
+        updatedAt: new Date(),
+      },
+      teacher: existingLesson.teacher,
+      unit: existingLesson.unit,
+      createdAt: existingLesson.createdAt,
+    };
+
+    await lessonsCollection.replaceOne(query, updatedLesson);
+
+    console.log(`✅ Added TEKS-aligned blocks to lesson ${lessonId}`);
+    console.log(`   - ${introBlocks.length} intro blocks`);
+    console.log(`   - ${lessonBlocks.length} lesson blocks`);
+
+    res.status(200).json({
+      success: true,
+      message: "TEKS-aligned blocks added successfully",
+      lessonId: lessonId,
+      blocksAdded: {
+        introBlocks: introBlocks.length,
+        lessonBlocks: lessonBlocks.length,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to add TEKS blocks:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add TEKS blocks: " + error.message,
+    });
+  }
+});
+
+// Bulk fix: Fix ALL lesson conditions in the database
+app.post("/fix-all-lesson-conditions", async (req, res) => {
+  try {
+    console.log("\n--- Bulk Fix All Lesson Conditions ---");
+
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Find all lessons with conditions that have null condition_value
+    const lessons = await lessonsCollection
+      .find({
+        lesson_conditions: { $exists: true, $not: { $size: 0 } },
+        "lesson_conditions.condition_value": null,
+      })
+      .toArray();
+
+    console.log(
+      `Found ${lessons.length} lessons with null condition_value fields`,
+    );
+
+    if (lessons.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No lessons need condition_value fixes",
+        lessonsProcessed: 0,
+        lessonsFixed: 0,
+      });
+    }
+
+    let lessonsFixed = 0;
+    const results = [];
+
+    // Fix each lesson
+    for (const lesson of lessons) {
+      const fixedConditions = lesson.lesson_conditions.map((condition) => {
+        if (
+          condition.condition_value === null &&
+          condition.value !== undefined
+        ) {
+          return {
+            ...condition,
+            condition_value: condition.value,
+          };
+        }
+        return condition;
+      });
+
+      // Update the lesson
+      await lessonsCollection.updateOne(
+        { _id: lesson._id },
+        { $set: { lesson_conditions: fixedConditions } },
+      );
+
+      lessonsFixed++;
+      results.push({
+        lessonId: lesson._id,
+        lessonTitle:
+          lesson.lesson_title || lesson.lesson?.lesson_title || "Unknown",
+        conditionsFixed: fixedConditions.filter(
+          (c) => c.condition_value === null,
+        ).length,
+      });
+
+      console.log(
+        `✅ Fixed lesson: ${lesson.lesson_title || "Unknown"} (${lesson._id})`,
+      );
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Fixed ${lessonsFixed} lessons with null condition_value fields`,
+      lessonsProcessed: lessons.length,
+      lessonsFixed: lessonsFixed,
+      results: results,
+    });
+  } catch (error) {
+    console.error("Failed to fix all lesson conditions:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fix lesson conditions: " + error.message,
     });
   }
 });
@@ -2824,7 +4316,7 @@ app.post("/migrate-admin-ownership", async (req, res) => {
       .toArray();
 
     console.log(
-      `Found ${unownedLessons.length} unowned lessons to assign to admin`
+      `Found ${unownedLessons.length} unowned lessons to assign to admin`,
     );
 
     // Assign all unowned lessons to admin
@@ -2840,7 +4332,7 @@ app.post("/migrate-admin-ownership", async (req, res) => {
     if (bulkOps.length > 0) {
       const bulkResult = await lessonsCollection.bulkWrite(bulkOps);
       console.log(
-        `Assigned ${bulkResult.modifiedCount} lessons to admin teacher`
+        `Assigned ${bulkResult.modifiedCount} lessons to admin teacher`,
       );
     }
 
@@ -2886,7 +4378,7 @@ app.get("/admin-lessons", async (req, res) => {
       .toArray();
 
     console.log(
-      `Found ${lessons.length} lessons created by admin@trinity-capital.net`
+      `Found ${lessons.length} lessons created by admin@trinity-capital.net`,
     );
 
     res.json({
@@ -3044,40 +4536,82 @@ app.get("/api/student-lessons/:studentId", async (req, res) => {
         .json({ success: false, message: "Student not found" });
     }
 
-    // Debug: Log the full student profile
+    // Get student's teacher name
+    const studentTeacher = studentProfile.teacher;
     console.log(
-      `[LESSON API] Full profile for ${studentId}:`,
-      JSON.stringify(studentProfile, null, 2)
+      `[LESSON API] Student ${studentId} is assigned to teacher: ${studentTeacher}`,
     );
 
-    // Debug: Log the student profile's assignedUnitIds
-    console.log(
-      `[LESSON API] Profile for ${studentId}: assignedUnitIds:`,
-      studentProfile.assignedUnitIds
-    );
+    const MASTER_TEACHER = "admin@trinity-capital.net";
 
-    // Collect all lessonIds from assignedUnitIds
-    const assignedUnits = Array.isArray(studentProfile.assignedUnitIds)
-      ? studentProfile.assignedUnitIds
-      : [];
-    console.log(
-      `[LESSON API] assignedUnits array:`,
-      JSON.stringify(assignedUnits, null, 2)
-    );
+    // CRITICAL LOGIC:
+    // 1. If student has a teacher assigned (not master), ONLY show that teacher's lessons
+    // 2. If student has no teacher or is assigned to master, show master lessons
+    // 3. Never show lessons from other teachers
+
     let allLessonIds = [];
-    assignedUnits.forEach((unit, idx) => {
-      console.log(`[LESSON API] Unit[${idx}]`, JSON.stringify(unit, null, 2));
-      if (Array.isArray(unit.lessonIds)) {
-        allLessonIds.push(...unit.lessonIds);
-      }
-    });
+
+    if (studentTeacher && studentTeacher !== MASTER_TEACHER) {
+      // Student has a non-master teacher assigned
+      console.log(
+        `[LESSON API] Student has custom teacher, fetching ${studentTeacher}'s lessons only`,
+      );
+
+      // Get lesson IDs from assignedUnitIds that match this teacher
+      const assignedUnits = Array.isArray(studentProfile.assignedUnitIds)
+        ? studentProfile.assignedUnitIds.filter(
+            (unit) => unit.teacherName === studentTeacher,
+          )
+        : [];
+
+      console.log(
+        `[LESSON API] Found ${assignedUnits.length} assigned units from teacher ${studentTeacher}`,
+      );
+
+      assignedUnits.forEach((unit, idx) => {
+        console.log(
+          `[LESSON API] Unit[${idx}]: ${unit.unitName} has ${
+            unit.lessonIds ? unit.lessonIds.length : 0
+          } lessons`,
+        );
+        if (Array.isArray(unit.lessonIds)) {
+          allLessonIds.push(...unit.lessonIds);
+        }
+      });
+    } else {
+      // Student is master teacher or has no teacher - show master lessons from assignedUnitIds
+      console.log(`[LESSON API] Using master teacher lessons`);
+
+      const assignedUnits = Array.isArray(studentProfile.assignedUnitIds)
+        ? studentProfile.assignedUnitIds.filter(
+            (unit) => unit.teacherName === MASTER_TEACHER,
+          )
+        : [];
+
+      console.log(
+        `[LESSON API] Found ${assignedUnits.length} assigned units from master teacher`,
+      );
+
+      assignedUnits.forEach((unit, idx) => {
+        console.log(
+          `[LESSON API] Unit[${idx}]: ${unit.unitName} has ${
+            unit.lessonIds ? unit.lessonIds.length : 0
+          } lessons`,
+        );
+        if (Array.isArray(unit.lessonIds)) {
+          allLessonIds.push(...unit.lessonIds);
+        }
+      });
+    }
 
     // Remove duplicates and filter falsy values
     allLessonIds = [...new Set(allLessonIds)].filter(Boolean);
-    console.log(`[LESSON API] All lessonIds collected:`, allLessonIds);
+    console.log(
+      `[LESSON API] All lessonIds collected: ${allLessonIds.length} unique IDs`,
+    );
 
     if (allLessonIds.length === 0) {
-      console.log(`[LESSON API] No lessonIds found for student: ${studentId}`);
+      console.log(`[LESSON API] No lessons assigned for student: ${studentId}`);
       return res.status(200).json({
         success: true,
         lessons: [],
@@ -3085,59 +4619,111 @@ app.get("/api/student-lessons/:studentId", async (req, res) => {
       });
     }
 
-    // Fetch lessons from Lessons collection by _id (convert string IDs to ObjectId if possible)
+    // Fetch lessons from Lessons collection by _id (convert string IDs to multiple formats)
     const { ObjectId } = require("mongodb");
     const studentLessonsCollection = client
       .db("TrinityCapital")
       .collection("Lessons");
-    // Convert all IDs to ObjectId if valid, else keep as string
-    const lessonIdQuery = allLessonIds.map((id) => {
-      // Convert to ObjectId if 24-char hex string
-      if (
-        typeof id === "string" &&
-        id.length === 24 &&
-        /^[a-fA-F0-9]+$/.test(id)
-      ) {
+
+    // Helper function to check if a string is a valid MongoDB ObjectId hex string
+    const isValidObjectIdHex = (str) => {
+      return typeof str === "string" && /^[0-9a-f]{24}$/i.test(str);
+    };
+
+    // Helper function to check if a string is a valid numeric ID
+    const isNumericId = (str) => {
+      return !isNaN(str) && str.trim() !== "";
+    };
+
+    // Build query to fetch lessons - handle multiple ID formats
+    const objectIdArray = [];
+    const numericIdArray = [];
+
+    allLessonIds.forEach((id) => {
+      if (isValidObjectIdHex(id)) {
         try {
-          return new ObjectId(id);
+          objectIdArray.push(new ObjectId(id));
         } catch (e) {
-          return id;
+          console.log(`⚠️ Failed to convert to ObjectId: ${id}`);
         }
+      } else if (isNumericId(id)) {
+        numericIdArray.push(parseInt(id, 10));
       }
-      // Convert to number if numeric string
-      if (typeof id === "string" && /^\d+$/.test(id)) {
-        return Number(id);
-      }
-      return id;
     });
-    const lessonDocs = await studentLessonsCollection
-      .find({
-        _id: { $in: lessonIdQuery },
-      })
-      .toArray();
+
+    console.log(
+      `[LESSON API] ID Processing: ${objectIdArray.length} ObjectIds, ${numericIdArray.length} numeric IDs`,
+    );
+
+    // Fetch lessons with both ID types
+    let lessonDocs = [];
+
+    // Query by ObjectIds
+    if (objectIdArray.length > 0) {
+      const objectIdResults = await studentLessonsCollection
+        .find({ _id: { $in: objectIdArray } })
+        .toArray();
+      lessonDocs.push(...objectIdResults);
+      console.log(
+        `[LESSON API] Found ${objectIdResults.length} lessons by ObjectId`,
+      );
+    }
+
+    // Query by numeric IDs
+    if (numericIdArray.length > 0) {
+      const numericIdResults = await studentLessonsCollection
+        .find({ _id: { $in: numericIdArray } })
+        .toArray();
+      lessonDocs.push(...numericIdResults);
+      console.log(
+        `[LESSON API] Found ${numericIdResults.length} lessons by numeric ID`,
+      );
+    }
 
     // Debug: Log found lessons
     console.log(
-      `[LESSON API] Found ${lessonDocs.length} lessons for student: ${studentId}`
+      `[LESSON API] Found ${lessonDocs.length} total lessons for student: ${studentId}`,
     );
     lessonDocs.forEach((doc, idx) => {
       console.log(
-        `[LESSON API] Lesson[${idx}]: _id=${doc._id}, title=${doc.lesson?.lesson_title}`
+        `[LESSON API] Lesson[${idx}]: _id=${doc._id}, title=${doc.lesson_title || "No title"}`,
       );
     });
 
-    // Format lessons for frontend (flatten lesson object)
-    const lessons = lessonDocs.map((doc) => ({
-      _id: doc._id,
-      ...doc.lesson,
-    }));
+    // Format lessons for frontend - handle both nested and flat lesson structures
+    const lessons = lessonDocs.map((doc) => {
+      // Handle both nested lesson structure and flat structure
+      return {
+        _id: doc._id,
+        lesson_title: doc.lesson_title || doc.lesson?.lesson_title || "",
+        lesson_description:
+          doc.lesson_description || doc.lesson?.lesson_description || "",
+        content: doc.content || doc.lesson?.content || [],
+        lesson_blocks: doc.lesson_blocks || doc.lesson?.lesson_blocks || [],
+        lesson_conditions:
+          doc.lesson_conditions || doc.lesson?.lesson_conditions || [],
+        learning_objectives:
+          doc.learning_objectives || doc.lesson?.learning_objectives || [],
+        intro_text_blocks:
+          doc.intro_text_blocks || doc.lesson?.intro_text_blocks || [],
+        required_actions:
+          doc.required_actions || doc.lesson?.required_actions || [],
+        success_metrics:
+          doc.success_metrics || doc.lesson?.success_metrics || {},
+        teacher: doc.teacher,
+        unit: doc.unit,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+      };
+    });
 
     console.log(
-      `[LESSON API] Returning ${lessons.length} lessons to frontend for student: ${studentId}`
+      `[LESSON API] Returning ${lessons.length} formatted lessons to frontend for student: ${studentId}`,
     );
     res.status(200).json({
       success: true,
       lessons,
+      studentTeacher: studentTeacher,
       message: `Retrieved ${lessons.length} lessons for student.`,
     });
   } catch (error) {
@@ -3195,7 +4781,7 @@ function validateRoutes() {
 
     if (route.path.includes(":") && route.path.includes("?")) {
       console.error(
-        `  ⚠️ WARNING: Both colon and question mark in route path: ${route.path}`
+        `  ⚠️ WARNING: Both colon and question mark in route path: ${route.path}`,
       );
     }
 
@@ -3206,7 +4792,7 @@ function validateRoutes() {
         const paramName = segment.substring(1);
         if (!paramName || paramName.length === 0) {
           console.error(
-            `  ⚠️ WARNING: Empty parameter name in route path: ${route.path}`
+            `  ⚠️ WARNING: Empty parameter name in route path: ${route.path}`,
           );
         }
         if (
@@ -3215,7 +4801,7 @@ function validateRoutes() {
           paramName.includes("?")
         ) {
           console.error(
-            `  ⚠️ WARNING: Invalid character in parameter name '${paramName}' in route path: ${route.path}`
+            `  ⚠️ WARNING: Invalid character in parameter name '${paramName}' in route path: ${route.path}`,
           );
         }
       }
