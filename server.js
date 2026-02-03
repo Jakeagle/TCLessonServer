@@ -1263,15 +1263,13 @@ app.get("/lessons/:teacherName", async (req, res) => {
         .find({ teacher: MASTER_TEACHER })
         .toArray(); // Get complete lesson documents
 
-      masterLessons = masterLessonsData.map((item) => ({
-        _id: item._id,
-        teacher: item.teacher,
-        unit: item.unit,
-        createdAt: item.createdAt,
-        updatedAt: item.updatedAt,
-        ...item.lesson, // This includes lesson_blocks, lesson_conditions, etc.
-        isMasterContent: true, // Flag to identify master content
-      }));
+      masterLessons = masterLessonsData.map((item) => {
+        return {
+          ...item, // Spread ALL top-level properties from MongoDB document (includes lesson_title)
+          ...item.lesson, // Then spread nested lesson if it exists (for backwards compatibility)
+          isMasterContent: true, // Flag to identify master content
+        };
+      });
 
       console.log(
         `Found ${masterLessons.length} master lessons from ${MASTER_TEACHER}.`,
@@ -1283,15 +1281,26 @@ app.get("/lessons/:teacherName", async (req, res) => {
       .find({ teacher: teacherName })
       .toArray(); // Get complete lesson documents
 
-    const teacherFlattenedLessons = teacherLessons.map((item) => ({
-      _id: item._id,
-      teacher: item.teacher,
-      unit: item.unit,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt,
-      ...item.lesson, // This includes lesson_blocks, lesson_conditions, etc.
-      isMasterContent: false, // Flag teacher's own content
-    }));
+    // DEBUG: Check what MongoDB actually returns
+    if (teacherLessons.length > 0) {
+      console.log(
+        `[MONGO DEBUG] First lesson from MongoDB:`,
+        JSON.stringify(teacherLessons[0]).substring(0, 500),
+      );
+      console.log(
+        `[MONGO DEBUG] lesson_title field:`,
+        teacherLessons[0].lesson_title,
+      );
+      console.log(`[MONGO DEBUG] All keys:`, Object.keys(teacherLessons[0]));
+    }
+
+    const teacherFlattenedLessons = teacherLessons.map((item) => {
+      return {
+        ...item, // Spread ALL top-level properties from MongoDB document (includes lesson_title)
+        ...item.lesson, // Then spread nested lesson if it exists (for backwards compatibility)
+        isMasterContent: false, // Flag teacher's own content
+      };
+    });
 
     // For lesson management modal: prioritize teacher's own units, fallback to master units
     let combinedUnits = [];
@@ -1455,6 +1464,11 @@ app.get("/lessons/:teacherName", async (req, res) => {
         unit: lessonDoc.unit,
         createdAt: lessonDoc.createdAt,
         updatedAt: lessonDoc.updatedAt,
+        // Include lesson_title and lesson_description from top level
+        ...(lessonDoc.lesson_title && { lesson_title: lessonDoc.lesson_title }),
+        ...(lessonDoc.lesson_description && {
+          lesson_description: lessonDoc.lesson_description,
+        }),
         // Spread nested lesson object properties
         ...(lessonDoc.lesson || {}),
         // Also include top-level content fields if they exist
