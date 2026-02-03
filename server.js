@@ -714,6 +714,15 @@ app.get("/lesson/:lessonId", async (req, res) => {
       unit: lesson.unit,
       createdAt: lesson.createdAt,
       updatedAt: lesson.updatedAt,
+      // Get lesson_title from top level FIRST, then fallback to nested if needed
+      lesson_title:
+        lesson.lesson_title ||
+        (lesson.lesson && lesson.lesson.lesson_title) ||
+        "",
+      lesson_description:
+        lesson.lesson_description ||
+        (lesson.lesson && lesson.lesson.lesson_description) ||
+        "",
       // Include ALL lesson content properties from nested lesson object
       ...(lesson.lesson || {}),
       // Also include top-level properties that might not be in lesson.lesson
