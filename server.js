@@ -4735,6 +4735,289 @@ app.get("/api/student-lessons/:studentId", async (req, res) => {
   }
 });
 
+/**
+ * SAMPLE TEACHER DATA CLEANUP ENDPOINTS
+ * These endpoints are called when a sample teacher logs out or closes the page
+ * They clear the units array and delete all lessons for that teacher
+ */
+
+/**
+ * DELETE /api/sample-teacher-cleanup/:teacherName
+ * Clears units array and deletes all lessons for a sample teacher
+ * Called on logout, refresh, or page close
+ */
+app.delete("/api/sample-teacher-cleanup/:teacherName", async (req, res) => {
+  try {
+    const { teacherName } = req.params;
+
+    if (!teacherName) {
+      return res.status(400).json({ error: "Missing teacherName parameter" });
+    }
+
+    console.log(
+      `🗑️  [SampleTeacherCleanup] Starting cleanup for teacher: ${teacherName}`,
+    );
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // Step 1: Clear the units array for this teacher
+    const teacherUpdateResult = await teachersCollection.updateOne(
+      { name: teacherName },
+      {
+        $set: {
+          units: [], // Clear ALL units
+          students: [], // Also clear students array
+          messages: [], // Clear messages
+        },
+      },
+    );
+
+    console.log(
+      `✅ [SampleTeacherCleanup] Cleared units for ${teacherName}: matched=${teacherUpdateResult.matchedCount}, modified=${teacherUpdateResult.modifiedCount}`,
+    );
+
+    // Step 2: Delete all lessons created by this teacher
+    const lessonsDeleteResult = await lessonsCollection.deleteMany({
+      teacher: teacherName,
+    });
+
+    console.log(
+      `✅ [SampleTeacherCleanup] Deleted ${lessonsDeleteResult.deletedCount} lessons for ${teacherName}`,
+    );
+
+    // Emit Socket.IO event to notify connected clients
+    io.emit("sampleTeacherDataCleaned", {
+      teacherName: teacherName,
+      timestamp: new Date().toISOString(),
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Sample teacher data cleaned for ${teacherName}`,
+      unitsCleared: teacherUpdateResult.modifiedCount > 0,
+      lessonsDeleted: lessonsDeleteResult.deletedCount,
+    });
+  } catch (error) {
+    console.error("Error during sample teacher cleanup:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to cleanup sample teacher data: " + error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/sample-teacher-cleanup/:teacherName
+ * Alternative POST endpoint for cleanup (in case DELETE doesn't work via fetch sendBeacon)
+ */
+app.post("/api/sample-teacher-cleanup/:teacherName", async (req, res) => {
+  try {
+    const { teacherName } = req.params;
+    const decodedTeacherName = decodeURIComponent(teacherName);
+
+    if (!decodedTeacherName) {
+      return res.status(400).json({ error: "Missing teacherName parameter" });
+    }
+
+    console.log("\n" + "=".repeat(80));
+    console.log(
+      `🗑️  [SampleTeacherCleanup-POST] Starting cleanup for teacher: ${decodedTeacherName}`,
+    );
+    console.log("=".repeat(80));
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    // DEBUG: Check what's in the database BEFORE cleanup
+    console.log(`\n📋 [DEBUG] Checking lessons BEFORE cleanup...`);
+    const lessonsBeforeDelete = await lessonsCollection
+      .find({ teacher: decodedTeacherName })
+      .toArray();
+    console.log(
+      `Found ${lessonsBeforeDelete.length} lessons for teacher: ${decodedTeacherName}`,
+    );
+    lessonsBeforeDelete.forEach((lesson, idx) => {
+      console.log(
+        `  [${idx + 1}] Lesson ID: ${lesson._id}, Teacher: "${lesson.teacher}", Title: "${
+          lesson.lesson_title || "N/A"
+        }"`,
+      );
+    });
+
+    // DEBUG: Check teacher document
+    console.log(`\n📋 [DEBUG] Checking teacher document...`);
+    const teacherDoc = await teachersCollection.findOne({
+      name: decodedTeacherName,
+    });
+    if (teacherDoc) {
+      console.log(`✓ Teacher found: ${teacherDoc.name}`);
+      console.log(
+        `  Units count: ${teacherDoc.units ? teacherDoc.units.length : 0}`,
+      );
+      if (teacherDoc.units && teacherDoc.units.length > 0) {
+        teacherDoc.units.forEach((unit, idx) => {
+          console.log(
+            `    [${idx + 1}] Unit: ${unit.name}, Lessons: ${
+              unit.lessons ? unit.lessons.length : 0
+            }`,
+          );
+        });
+      }
+    } else {
+      console.log(`✗ Teacher not found: ${decodedTeacherName}`);
+    }
+
+    // Step 1: Clear the units array for this teacher
+    console.log(`\n🔄 [STEP 1] Clearing units array...`);
+    const teacherUpdateResult = await teachersCollection.updateOne(
+      { name: decodedTeacherName },
+      {
+        $set: {
+          units: [], // Clear ALL units
+          students: [], // Also clear students array
+          messages: [], // Clear messages
+        },
+      },
+    );
+
+    console.log(
+      `✅ Cleared units for ${decodedTeacherName}: matched=${teacherUpdateResult.matchedCount}, modified=${teacherUpdateResult.modifiedCount}`,
+    );
+
+    // Step 2: Delete all lessons created by this teacher
+    console.log(`\n🔄 [STEP 2] Deleting lessons...`);
+    console.log(`Query: { teacher: "${decodedTeacherName}" }`);
+    const lessonsDeleteResult = await lessonsCollection.deleteMany({
+      teacher: decodedTeacherName,
+    });
+
+    console.log(
+      `✅ Deleted ${lessonsDeleteResult.deletedCount} lessons for ${decodedTeacherName}`,
+    );
+
+    // DEBUG: Verify lessons are deleted
+    console.log(`\n📋 [DEBUG] Checking lessons AFTER cleanup...`);
+    const lessonsAfterDelete = await lessonsCollection
+      .find({ teacher: decodedTeacherName })
+      .toArray();
+    console.log(`Found ${lessonsAfterDelete.length} lessons remaining`);
+    if (lessonsAfterDelete.length > 0) {
+      console.log("⚠️  WARNING: Lessons still exist after delete!");
+      lessonsAfterDelete.forEach((lesson) => {
+        console.log(`  Remaining: ${lesson._id} - ${lesson.lesson_title}`);
+      });
+    }
+
+    // Emit Socket.IO event to notify connected clients
+    io.emit("sampleTeacherDataCleaned", {
+      teacherName: decodedTeacherName,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log("=".repeat(80) + "\n");
+
+    res.status(200).json({
+      success: true,
+      message: `Sample teacher data cleaned for ${decodedTeacherName}`,
+      unitsCleared: teacherUpdateResult.modifiedCount > 0,
+      lessonsDeleted: lessonsDeleteResult.deletedCount,
+    });
+  } catch (error) {
+    console.error("Error during sample teacher cleanup:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to cleanup sample teacher data: " + error.message,
+    });
+  }
+});
+
+// DEBUG ENDPOINT: Get all lessons for a specific teacher
+app.get("/api/debug/lessons/:teacherName", async (req, res) => {
+  try {
+    const { teacherName } = req.params;
+    const decodedTeacherName = decodeURIComponent(teacherName);
+
+    console.log(
+      `\n🔍 [DEBUG-GET] Querying lessons for teacher: ${decodedTeacherName}`,
+    );
+
+    const lessonsCollection = client.db("TrinityCapital").collection("Lessons");
+
+    const lessons = await lessonsCollection
+      .find({ teacher: decodedTeacherName })
+      .toArray();
+
+    console.log(`Found ${lessons.length} lessons for ${decodedTeacherName}`);
+    lessons.forEach((lesson) => {
+      console.log(
+        `  - ID: ${lesson._id}, Title: "${lesson.lesson_title}", Teacher: "${lesson.teacher}"`,
+      );
+    });
+
+    res.status(200).json({
+      success: true,
+      teacherName: decodedTeacherName,
+      lessonCount: lessons.length,
+      lessons: lessons,
+    });
+  } catch (error) {
+    console.error("Error getting debug lessons:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// DEBUG ENDPOINT: Get teacher document details
+app.get("/api/debug/teacher/:teacherName", async (req, res) => {
+  try {
+    const { teacherName } = req.params;
+    const decodedTeacherName = decodeURIComponent(teacherName);
+
+    console.log(
+      `\n🔍 [DEBUG-GET] Querying teacher document: ${decodedTeacherName}`,
+    );
+
+    const teachersCollection = client
+      .db("TrinityCapital")
+      .collection("Teachers");
+
+    const teacher = await teachersCollection.findOne({
+      name: decodedTeacherName,
+    });
+
+    if (teacher) {
+      console.log(`✓ Found teacher: ${teacher.name}`);
+      console.log(`  Units: ${teacher.units ? teacher.units.length : 0}`);
+      console.log(
+        `  Students: ${teacher.students ? teacher.students.length : 0}`,
+      );
+      console.log(
+        `  Messages: ${teacher.messages ? teacher.messages.length : 0}`,
+      );
+    } else {
+      console.log(`✗ Teacher not found: ${decodedTeacherName}`);
+    }
+
+    res.status(200).json({
+      success: true,
+      teacher: teacher || null,
+    });
+  } catch (error) {
+    console.error("Error getting debug teacher:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
